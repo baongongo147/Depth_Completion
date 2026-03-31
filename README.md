@@ -1,3 +1,4 @@
+This repo is cloned from repo https://github.com/Wang-xjtu/G2-MonoDepth
 # T-PAMI2024: G2-MonoDepth
 
 **[G2-MonoDepth: A General Framework of Generalized Depth Inference from Monocular RGB+X Data](https://arxiv.org/abs/2310.15422)**
