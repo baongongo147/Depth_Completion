@@ -5,6 +5,8 @@ import os
 import torch
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"  # gpus
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # gpus
+# os.environ["TORCHDYNAMO_VERBOSE"] = "1"
 
 # turn fast mode on
 torch.backends.cudnn.enabled = True
@@ -27,4 +29,5 @@ def DDP_main(rank, world_size):
 if __name__ == "__main__":
     if torch.cuda.is_available():
         n_gpus = torch.cuda.device_count()
+        print(f"[INFO] Using {n_gpus} GPUS.")
         DDPutils.run_demo(DDP_main, n_gpus)
