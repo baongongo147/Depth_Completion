@@ -3,7 +3,9 @@ from torch import Tensor
 from torch.nn import Module, Conv2d, init, Sequential
 from .modules import FirstModule, UNetModule, StackedBottleNeck
 
-chan = [512, 512, 512, 512, 256, 128, 64]
+# chan = [512, 512, 512, 512, 256, 128, 64]           # original configuration
+# chan = [512, 512, 512, 256, 128, 64, 32]          # lighter configuration
+chan = [512, 512, 512, 512, 512, 256, 128]        # deeper (stronger) configuration
 
 
 class UNet(Module):
@@ -19,7 +21,13 @@ class UNet(Module):
             StackedBottleNeck(chan[i], chan[i], rezero),
             layer,
             StackedBottleNeck(2 * chan[i], chan[i], rezero),
-            Conv2d(chan[i], 1, 3, 1, 1),
+
+            # Conv2d(chan[i], 1, 3, 1, 1),                # original configuration
+            # test new head: Đây là một đầu ra “softer”, thêm một tầng ẩn với kích thước (chan[i] // 2) và một ReLU trước khi chuyển về 1 kênh.
+            # Purpose: tăng khả năng biểu diễn của head, không chỉ một conv đơn. Có thể giúp mạng học tốt hơn nếu đầu ra cần thêm phi tuyến tính.
+            Conv2d(chan[i], chan[i] // 2, 3, 1, 1),
+            torch.nn.ReLU(inplace=True),
+            Conv2d(chan[i] // 2, 1, 3, 1, 1),
         )
 
         # initializing

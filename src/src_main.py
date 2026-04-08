@@ -86,7 +86,7 @@ class G2_MonoDepth:
             # sobel grad
             loss_rgrad = self.grad_function(sta_depth, sta_gt, hole_gt)
 
-            loss = loss_adepth + loss_rdepth + 0.5 * loss_rgrad
+            loss = 1.5 * loss_adepth + loss_rdepth + 0.8 * loss_rgrad
 
         self.optimizer.zero_grad()
         if self.scaler is not None:
