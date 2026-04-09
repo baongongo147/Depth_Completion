@@ -1,0 +1,3 @@
+[submodule "G2-MonoDepth"]
+	path = G2-MonoDepth
+	url = https://github.com/Wang-xjtu/G2-MonoDepth
