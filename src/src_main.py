@@ -63,7 +63,17 @@ class G2_MonoDepth:
             map_location = {"cuda:%d" % 0: "cuda:%d" % self.rank}
             checkpoint = torch.load(cf.checkpoint, map_location=map_location)
             self.start_epoch = checkpoint["epoch"]
-            self.network.module.load_state_dict(checkpoint["network"])
+
+            # Load trọng số vào module của DDP
+            pretrained_dict = checkpoint["network"]
+            model_dict = self.network.module.state_dict()
+            # Chỉ load những lớp có tên và kích thước giống nhau (bỏ qua Head đã sửa)
+            pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict and v.size() == model_dict[k].size()}
+            print(f"Đã load {len(pretrained_dict)} lớp từ checkpoint cũ.")
+            model_dict.update(pretrained_dict)
+            self.network.module.load_state_dict(model_dict)
+
+            # self.network.module.load_state_dict(checkpoint["network"])        # Original config to load all weights (include Head)
             self.optimizer.load_state_dict(checkpoint["optimizer"])
             self.scheduler.load_state_dict(checkpoint["scheduler"])
             self.scaler.load_state_dict(checkpoint["scaler"])
