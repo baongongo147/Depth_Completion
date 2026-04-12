@@ -7,6 +7,8 @@ import os
 import time
 import json
 
+import common
+
 # --- 1. DIRECTORY SETUP ---
 SAVE_DIR = "lidar_image_pairs"
 if not os.path.exists(SAVE_DIR):
@@ -22,18 +24,16 @@ except FileNotFoundError:
     dist_coeffs = np.zeros(5)
 
 # --- 3. PARAMETERS ---
-SCREEN_SIZE = (512, 256)
-LIDAR_MIN_DIST = 150.0   # 15cm in mm
-LIDAR_MAX_DIST = 12000.0 # 12m in mm
 fx = K[0, 0]
-cam_fov_h = 2 * math.atan(SCREEN_SIZE[0] / (2 * fx)) * (180 / math.pi)
+cam_fov_h = 2 * math.atan(common.CAMERA_BUFFER_SIZE[0] / (2 * fx)) * (180 / math.pi)
 
 def nothing(x):
     pass
 
+
 def main():
     picam2 = Picamera2()
-    config = picam2.create_preview_configuration(main={"format": "RGB888", "size": SCREEN_SIZE})
+    config = picam2.create_preview_configuration(main={"format": "RGB888", "size": common.CAMERA_BUFFER_SIZE})
     picam2.configure(config)
     picam2.start()
 
@@ -45,40 +45,40 @@ def main():
         print("Controls: [SPACE] to Capture, [Q] to Quit")
 
         for scan in lidar.iter_scans():
-
-            
             raw_rgb = picam2.capture_array()
-            # Convert RGB to BGR for OpenCV display/saving
-            frame_bgr = cv2.cvtColor(raw_rgb, cv2.COLOR_RGB2BGR)
-            
-            projected_view = frame_bgr.copy()
-            radar_view = np.zeros((SCREEN_SIZE[1], SCREEN_SIZE[0], 3), dtype=np.uint8)
-            cx, cy = SCREEN_SIZE[0] // 2, SCREEN_SIZE[1] // 2
-            cv2.line(radar_view, (cx-5, cy), (cx+5, cy), (50, 50, 50), 1)
-            cv2.line(radar_view, (cx, cy-5), (cx, cy+5), (50, 50, 50), 1)
+
+            radar_view = np.zeros((common.LIDAR_VIEW_SIZE[0], common.LIDAR_VIEW_SIZE[1], 3), dtype=np.uint8)
+            radar_ruler_color = (50, 50, 50)
+            cx, cy = common.LIDAR_VIEW_SIZE[0] // 2, common.LIDAR_VIEW_SIZE[1] // 2
+            cv2.line(radar_view, (0, cy), (common.LIDAR_VIEW_SIZE[0], cy), radar_ruler_color, 1)
+            cv2.line(radar_view, (cx, 0), (cx, common.LIDAR_VIEW_SIZE[1]), radar_ruler_color, 1)
+            cv2.putText(radar_view, "-z", (0, cy), cv2.FONT_HERSHEY_COMPLEX, 1.0,  radar_ruler_color)
+            cv2.putText(radar_view, "+z", (common.LIDAR_VIEW_SIZE[0] - 40, cy), cv2.FONT_HERSHEY_COMPLEX, 1.0,  radar_ruler_color)
+
+            cv2.putText(radar_view, "+x", (cx, 40), cv2.FONT_HERSHEY_COMPLEX, 1.0,  radar_ruler_color)
+            cv2.putText(radar_view, "-x", (cx, common.LIDAR_VIEW_SIZE[1]), cv2.FONT_HERSHEY_COMPLEX, 1.0,  radar_ruler_color)
             
             # Prepare current scan data for potential saving
             current_scan_data = []
 
             for (quality, angle, distance) in scan:
-                # Filter based on your 15cm - 12m requirement
-                if LIDAR_MIN_DIST <= distance <= LIDAR_MAX_DIST:
-                    current_scan_data.append([angle, distance])
-                    
-                    # --- VIZ LOGIC (Project to Camera) ---
-                    angle_rad = math.radians(angle)
-                    lx = (distance / 1000.0) * math.cos(angle_rad)
-                    ly = (distance / 1000.0) * math.sin(angle_rad)
+                    lx, lz = common.angleDistanceToLidarXZ(angle, distance)
+                    current_scan_data.append([lx, 0.0, lz])
 
-                    # --- VIZ LOGIC (Radar View) ---
-                    rx = int(cx + (ly * 80)) 
-                    ry = int(cy - (lx * 80))
-                    if 0 <= rx < SCREEN_SIZE[0] and 0 <= ry < SCREEN_SIZE[1]:
-                        cv2.circle(radar_view, (rx, ry), 1, (255, 255, 255), -1)
+                    #Convert to meters for easier to look at
+                    lx_m = lx / 1000.0
+                    lz_m = lz / 1000.0
+                    u = int(cx + (lz_m * common.LIDAR_VIEW_SCALE)) 
+                    v = int(cy - (lx_m * common.LIDAR_VIEW_SCALE))
+                    if 0 <= u < common.LIDAR_VIEW_SIZE[0] and 0 <= v < common.LIDAR_VIEW_SIZE[1]:
+                        text = f"{lx_m:.2f} | {lz_m:.2f}"
+                        cv2.putText(radar_view, text, (u, v), cv2.FONT_HERSHEY_COMPLEX_SMALL, 0.8, (255, 255, 255))
+                        cv2.circle(radar_view, (u, v), 1, (255, 255, 255), -1)
 
             # Display and Interaction
-            combined = np.hstack((projected_view, radar_view))
-            cv2.imshow('FOV & Extrinsic Alignment', combined)
+            #combined = np.hstack((raw_rgb, radar_view))
+            cv2.imshow('Camera', raw_rgb)
+            cv2.imshow('Lidar', radar_view)
             
             key = cv2.waitKey(1) & 0xFF
             
@@ -89,7 +89,7 @@ def main():
                 img_path = os.path.join(SAVE_DIR, f"cap_{timestamp}_{capture_count}.jpg")
                 
                 # Save the image (original BGR frame)
-                cv2.imwrite(img_path, frame_bgr)
+                cv2.imwrite(img_path, raw_rgb)
 
                 json_metadata = {
                     "timestamp": timestamp,

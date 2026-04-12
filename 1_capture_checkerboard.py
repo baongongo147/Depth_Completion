@@ -4,9 +4,10 @@ from picamera2 import Picamera2
 import os
 import time
 
+import common
+
 # --- SETTINGS ---
 CHESSBOARD_SIZE = (14, 14) 
-SCREEN_SIZE = (512, 256)
 SAVE_DIR = "cali"
 CAPTURE_INTERVAL = 1.0  # Seconds between auto-captures
 
@@ -14,7 +15,7 @@ if not os.path.exists(SAVE_DIR):
     os.makedirs(SAVE_DIR)
 
 picam2 = Picamera2()
-config = picam2.create_preview_configuration(main={"format": "RGB888", "size": SCREEN_SIZE})
+config = picam2.create_preview_configuration(main={"format": "RGB888", "size": common.CAMERA_BUFFER_SIZE})
 picam2.configure(config)
 picam2.set_controls({"AfMode": 0, "LensPosition": 1.0}) 
 picam2.start()
@@ -71,7 +72,7 @@ try:
             # Reset timer so it triggers immediately when enabled
             last_capture_time = 0 
                 
-        elif key == 27: # ESC
+        elif key == ord('q'):
             break
 
 finally:
