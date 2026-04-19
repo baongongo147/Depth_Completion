@@ -43,7 +43,7 @@ if len(objpoints) > 10:
     ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(objpoints, imgpoints, img_size, None, None)
     np.savez(OUTPUT_FILE, mtx=mtx, dist=dist)
     
-    h_fov, v_fov = common.calculate_fov(mtx, img_size[0], img_size[1])
+    h_fov, v_fov = common.calculate_fov(mtx)
     print("-" * 30)
     print(f"CALIBRATION COMPLETE (RMS: {ret:.4f})")
     print(f"FOV: {h_fov:.2f}H x {v_fov:.2f}V")

@@ -9,21 +9,16 @@ import json
 
 import common
 
-# --- 1. DIRECTORY SETUP ---
-SAVE_DIR = "lidar_image_pairs"
-if not os.path.exists(SAVE_DIR):
-    os.makedirs(SAVE_DIR)
 
 # --- 2. LOAD CALIBRATION ---
 try:
     calib = np.load("picam3_calib.npz")
+    extrin = np.load("extrinsics.npz")
     K, dist_coeffs = calib['mtx'], calib['dist']
+    tvec, rvec = extrin['t'], extrin['r']
 except FileNotFoundError:
-    print("Warning: picam3_calib.npz not found. Using identity matrix.")
-    K = np.eye(3)
-    dist_coeffs = np.zeros(5)
+    print("Warning: picam3_calib.npz not found.")
 
-# --- 3. PARAMETERS ---
 fx = K[0, 0]
 cam_fov_h = 2 * math.atan(common.CAMERA_BUFFER_SIZE[0] / (2 * fx)) * (180 / math.pi)
 
@@ -32,6 +27,9 @@ def nothing(x):
 
 
 def main():
+    global rvec
+    global tvec
+
     picam2 = Picamera2()
     config = picam2.create_preview_configuration(main={"format": "RGB888", "size": common.CAMERA_BUFFER_SIZE})
     picam2.configure(config)
@@ -42,7 +40,6 @@ def main():
     
     try:
         print(f"Detected Camera FOV: {cam_fov_h:.2f} degrees")
-        print("Controls: [SPACE] to Capture, [Q] to Quit")
         print("Lidar status" + lidar.get_health()[0])
         for scan in lidar.iter_scans():
             raw_rgb = picam2.capture_array()
@@ -63,7 +60,7 @@ def main():
 
             for (quality, angle, distance) in scan:
                     lx, lz = common.angleDistanceToLidarXZ(angle, distance)
-                    current_scan_data.append([lx, 0.0, lz])
+                    current_scan_data.append([lx, 0.0, lz, distance])
 
                     #Convert to meters for easier to look at
                     lx_m = lx / 1000.0
@@ -77,33 +74,52 @@ def main():
 
             # Display and Interaction
             #combined = np.hstack((raw_rgb, radar_view))
-            cv2.imshow('Camera', raw_rgb)
             cv2.imshow('Lidar', radar_view)
-            
-            key = cv2.waitKey(1) & 0xFF
-            
-            # --- CAPTURE LOGIC ---
-            if key == ord(' '):
-                timestamp = int(time.time())
-                fn = f"cap_{timestamp}_{capture_count}"
-                img_path = os.path.join(SAVE_DIR, f"cap_{timestamp}_{capture_count}.jpg")
-                
-                # Save the image (original BGR frame)
-                cv2.imwrite(img_path, raw_rgb)
 
-                json_metadata = {
-                    "timestamp": timestamp,
-                    "capture_id": capture_count,
-                    "lidar_points": current_scan_data
-                }
+            for p in current_scan_data:
+                position = [p[0], p[1], p[2]]
+                if position[2] < 0.0:
+                    continue
+                distance = p[3]
+                lidar_pos = np.array(position, dtype=np.float32)
+                R_mat, _ = cv2.Rodrigues(rvec)
+                lidar_cam_coords = (R_mat @ lidar_pos) - np.array([0, 0, 0], dtype=np.float32)
+
                 
-                with open(os.path.join(SAVE_DIR, f"{fn}.json"), 'w') as f:
-                    json.dump(json_metadata, f, indent=4) # indent=4 makes it readable
-                
-                print(f"Saved pair {capture_count}: {img_path}")
-                capture_count += 1
-                
-            elif key == ord('q'):
+
+
+                # rvec = np.array([0, 0, 0], dtype=np.float32)
+                # tvec = np.array([0, 0, 0], dtype=np.float32)
+                img_pts, jacobian = cv2.projectPoints(lidar_pos, rvec, tvec, K, dist_coeffs)  
+                img_pts = img_pts.reshape(-1, 2)
+
+                for pt in img_pts:
+                    if not np.all(np.isfinite(pt)):
+                        continue
+                    # Extract x and y
+                    x, y = pt
+                    
+                    # 3. Cast to int for cv2.circle
+                    center = (int(x), int(y))
+                    
+                    # Optional: Only draw if the point is within the image boundaries
+                    height, width = raw_rgb.shape[:2]
+                    if 0 <= center[0] < width and 0 <= center[1] < height:
+                        min_dist = 150 #mm
+                        max_dist = 12000 #mm
+                        dist_clipped = np.clip(distance, min_dist, max_dist)
+    
+                        # 2. Normalize distance to a 0.0 - 1.0 range
+                        # t = 0 is Red (min), t = 1 is Blue (max)
+                        t = (dist_clipped - min_dist) / (max_dist - min_dist)
+                        r = int((1 - t) * 255 + t * 0)
+                        b = int((1 - t) * 0 + t * 255)
+                        cv2.circle(raw_rgb, center, 1, (r, 0, b), -1)
+            
+            cv2.imshow('Camera', raw_rgb)
+
+            key = cv2.waitKey(1) & 0xFF  
+            if key == ord('q'):
                 break
 
     finally:
