@@ -30,7 +30,8 @@ def parse_arguments():
 
 def demo_save_openvino(args, compiled_model):
     print(f"----------- Bắt đầu dự đoán trên tập dữ liệu -----------")
-    raw_dirs = ["0%", "1%", "100%"]
+    # raw_dirs = ["0%", "1%", "100%"]
+    raw_dirs = ["1%"]
     rgbd_reader = RGBPReader()
     
     # Lấy thông tin đầu ra
@@ -88,7 +89,8 @@ def demo_save_openvino(args, compiled_model):
 
 def demo_metric_openvino(args):
     """Tính toán sai số dựa trên các ảnh đã lưu ở bước trên"""
-    raw_dirs = ["0%", "1%", "100%"]
+    # raw_dirs = ["0%", "1%", "100%"]
+    raw_dirs = ["1%"]
     print("\n----------- Đang tính toán Metrics (RMSE/MAE) -----------")
     
     for raw_dir in raw_dirs:

@@ -33,7 +33,8 @@ def demo_save_onnx(args):
     # Khởi tạo phiên làm việc với ONNX Runtime
     session = ort.InferenceSession(args.onnx_path, providers=['CPUExecutionProvider'])
     
-    raw_dirs = ["0%", "1%", "100%"]
+    # raw_dirs = ["0%", "1%", "100%"]
+    raw_dirs = ["1%"]
     print("----------- Start Inferring on Dataset -----------")
     
     for raw_dir in raw_dirs:
@@ -91,7 +92,8 @@ def demo_save_onnx(args):
 
 def demo_metric_fixed(args):
     """Tính toán lại metric từ các ảnh đã lưu ở bước trên"""
-    raw_dirs = ["0%", "1%", "100%"]
+    # raw_dirs = ["0%", "1%", "100%"]
+    raw_dirs = ["1%"]
     print("\n----------- Calculating Metrics -----------")
     
     for raw_dir in raw_dirs:
