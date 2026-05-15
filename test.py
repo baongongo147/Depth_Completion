@@ -45,7 +45,8 @@ def demo_save(args):
     print("-----------building model-------------")
     network = UNet(rezero=True).to(device).eval()
     network.load_state_dict(torch.load(args.model_dir, map_location=device)["network"])
-    raw_dirs = ["0%", "1%", "100%"]
+    # raw_dirs = ["0%", "1%", "100%"]
+    raw_dirs = ["1%"]
     print("-----------inferring---------------")
     for raw_dir in raw_dirs:
         with torch.no_grad():
@@ -69,7 +70,8 @@ def demo_save(args):
 
 
 def demo_metric(args):
-    raw_dirs = ["0%", "1%", "100%"]
+    # raw_dirs = ["0%", "1%", "100%"]
+    raw_dirs = ["1%"]
     for raw_dir in raw_dirs:
         srmse = 0.0
         ord_error = 0.0

@@ -89,7 +89,7 @@ class RandomDepth(torch.nn.Module):
         depth = depth * scale_factor
         return depth
 
-
+# Không dùng Vertical Flip để tránh làm đảo lộn vị trí tương đối của sàn và trần nhà so với dòng LiDAR
 class TransformUtils(object):
     def __init__(self, size):
         self._rgbgt_transform = trans.Compose(
@@ -114,7 +114,7 @@ class TransformUtils(object):
                     fill=1.0,
                 ),
                 trans.RandomHorizontalFlip(0.5),
-                trans.RandomVerticalFlip(0.5),
+                # trans.RandomVerticalFlip(0.5),
             ]
         )
         self.pro_list = [0.2, 0.4, 0.6]
@@ -136,25 +136,44 @@ class TransformUtils(object):
             raw = raw * hole
         return raw
 
-    def trans_raw(self, gt, hole_gt, hole_ls):
-        raw = gt.clone()
-        # Random sampling
-        p_blur = 0.5
-        random_factor = np.random.uniform(0.0, 1.0)
-        if random_factor < self.pro_list[0]:
-            zero_rate = 0.0  # depth recovery
-            p_blur = 1.0
-        elif random_factor < self.pro_list[1]:
-            zero_rate = np.random.uniform(0.0, 0.9)  # not very sparse depth completion
-        elif random_factor < self.pro_list[2]:
-            zero_rate = np.random.uniform(0.9, 1.0)  # very sparse depth completion
+    def _sample_lidar_line(self, depth_map, step=5, training=True):
+        """
+        Tối ưu cho RPLidar: 
+        - Lấy mẫu 1 dòng duy nhất.
+        - step=5: Mô phỏng mật độ điểm thực tế của LiDAR.
+        - training=True: Nhảy dòng ngẫu nhiên để model không bị overfit vào 1 vị trí cố định.
+        """
+        sampled = torch.zeros_like(depth_map)
+        height, width = depth_map.shape[-2], depth_map.shape[-1]
+
+        if training:
+            # Di chuyển dòng mẫu ngẫu nhiên trong khoảng +-20 pixel để tránh overfitting
+            # Giúp model nhận diện thực tế hơn (LiDAR ngoài thực tế bị lệch nhẹ)
+            target_row = np.random.randint(height // 2 - 20, height // 2 + 20)
         else:
-            zero_rate = 1.0  # depth estimation
-        # add noise blur
-        if zero_rate < 1:
-            raw = self._noiseblur(raw, hole_gt, p_blur=p_blur)
-            raw = self._holes(raw, hole_ls)
-        raw = self._sample(raw, zero_rate)
+            # Khi test hoặc inference, cố định dòng mẫu ở giữa để đánh giá nhất quán
+            target_row = height // 2
+
+        # Lấy data point theo step=5 để mô phỏng mật độ điểm LiDAR
+        for col in range(0, width, step):
+            sampled[..., target_row, col] = depth_map[..., target_row, col]
+
+        return sampled
+
+    # Loại bỏ Sparse ngẫu nhiên toàn ảnh để tập trung vào xử lí data point 1 dòng duy nhất được nhận từ LiDAR
+    def trans_raw(self, gt, hole_gt, hole_ls ,training=True):
+        raw = gt.clone()
+
+        # Trong quá trình training, thêm nhiễu và blur nhẹ để mô phỏng sai số của LiDAR trong thực tế
+        if training:
+            raw = self._noiseblur(raw, hole_gt, p_noise=0.3, p_blur=0.3)        # có thể thay p_noise=0.5, p_blur=0.5 
+            # Thêm các lỗ trống ngẫu nhiên để mô phỏng các điểm mất dữ liệu thực tế của LiDAR (vật liệu hấp thụ laser, ...)
+            raw = self._holes(raw, hole_ls, p=0.5)                              # có thể thay p=0.8 để tăng tỉ lệ lỗ trống
+        
+        # Thực hiện lấy mẫu 1 dòng 
+        # Sử dụng step=5 để mô phỏng mật độ điểm thưa của LiDAR
+        raw = self._sample_lidar_line(raw, step=5, training=training)
+
         return raw
 
     @staticmethod
@@ -265,6 +284,7 @@ class RGBDHDataset(Dataset):
         # names of RGB and depth should be paired
         rgb_path = self.rgb_ls[item]
         depth_path = self.depth_ls[item]
+        # Kiểm tra tên file RGB và depth có khớp nhau không (bỏ phần mở rộng .png)
         assert (
             rgb_path.name[:-4] == depth_path.name[:-4]
         ), f"The RGB {str(self.rgb_ls[item])} and gen_depth {str(self.depth_ls[item])} is unpaired"
@@ -272,7 +292,8 @@ class RGBDHDataset(Dataset):
         gt = depth_read(depth_path)
         rgb, gt = self.transforms.trans_rgbgt(rgb, gt)
         hole_gt = torch.where(gt == 0, torch.zeros_like(gt), torch.ones_like(gt))
-        raw = self.transforms.trans_raw(gt, hole_gt, self.hole_ls)
+        # Bật training=True để sử dụng cho training hoặc fine-tuning: thêm data augmentation (noise, blur, holes) để mô phỏng LiDAR thực tế
+        raw = self.transforms.trans_raw(gt, hole_gt, self.hole_ls, training=True)
         return rgb, gt, raw
 
 

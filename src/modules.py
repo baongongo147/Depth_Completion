@@ -1,5 +1,6 @@
 from torch import Tensor
-from torch.nn import Module, Conv2d, Sequential, UpsamplingNearest2d
+# from torch.nn import Module, Conv2d, Sequential, UpsamplingNearest2d
+from torch.nn import Module, Conv2d, Sequential, Upsample
 from .custom_blocks import BottleNeck
 import torch
 
@@ -35,7 +36,8 @@ class FirstModule(Module):
         self.block = Sequential(
             Conv2d(in_channel, out_channel, 3, 2, 1),
             StackedBottleNeck(out_channel, out_channel, rezero),
-            UpsamplingNearest2d(scale_factor=2),
+            # UpsamplingNearest2d(scale_factor=2),
+            Upsample(scale_factor=2.0, mode='bilinear', align_corners=False), # Dùng Bilinear
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -57,7 +59,8 @@ class UNetModule(Module):
             StackedBottleNeck(mid_channel, mid_channel, rezero),
             mid_module,
             StackedBottleNeck(2 * mid_channel, in_channel, rezero),
-            UpsamplingNearest2d(scale_factor=2),
+            # UpsamplingNearest2d(scale_factor=2),
+            Upsample(scale_factor=2.0, mode='bilinear', align_corners=False), # Dùng Bilinear
         )
 
     def forward(self, x: Tensor) -> Tensor:

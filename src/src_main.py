@@ -10,6 +10,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from .utils import save_img, min_max_norm, print_model_parm_nums, StandardizeData
 from .data_tools import get_dataloader
+from .data_tools_real import get_real_dataloader
 from .losses import (
     WeightedDataLoss,
     WeightedMSGradLoss,
@@ -39,14 +40,25 @@ class G2_MonoDepth:
         )  # create optimizers
         self.network = torch.compile(self.network)  # pytorch 2.0
         # dataloader and datasampler
-        self.loader, self.sampler = get_dataloader(
-            cf.rgbd_dirs,
-            cf.hole_dirs,
-            cf.batch_size,
-            cf.sizes,
-            self.rank,
-            cf.num_workers,
-        )
+        # Nếu có dataset_dir (Private_Real_Dataset) → dùng real dataloader
+        # Nếu không → dùng dataloader gốc (RGBD_Datasets + Hole_Datasets)
+        if hasattr(cf, 'dataset_dir') and cf.dataset_dir is not None:
+            self.loader, self.sampler = get_real_dataloader(
+                cf.dataset_dir,
+                cf.batch_size,
+                cf.sizes,
+                self.rank,
+                cf.num_workers,
+            )
+        else:
+            self.loader, self.sampler = get_dataloader(
+                cf.rgbd_dirs,
+                cf.hole_dirs,
+                cf.batch_size,
+                cf.sizes,
+                self.rank,
+                cf.num_workers,
+            )
         self.iteration_num = len(self.loader)
         # learning rate scheduler: cosine decay
         self.scheduler = CosineAnnealingLR(
@@ -63,7 +75,17 @@ class G2_MonoDepth:
             map_location = {"cuda:%d" % 0: "cuda:%d" % self.rank}
             checkpoint = torch.load(cf.checkpoint, map_location=map_location)
             self.start_epoch = checkpoint["epoch"]
-            self.network.module.load_state_dict(checkpoint["network"])
+
+            # Load trọng số vào module của DDP
+            pretrained_dict = checkpoint["network"]
+            model_dict = self.network.module.state_dict()
+            # Chỉ load những lớp có tên và kích thước giống nhau (bỏ qua Head đã sửa)
+            pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict and v.size() == model_dict[k].size()}
+            print(f"Đã load {len(pretrained_dict)} lớp từ checkpoint cũ.")
+            model_dict.update(pretrained_dict)
+            self.network.module.load_state_dict(model_dict)
+
+            # self.network.module.load_state_dict(checkpoint["network"])        # Original config to load all weights (include Head)
             self.optimizer.load_state_dict(checkpoint["optimizer"])
             self.scheduler.load_state_dict(checkpoint["scheduler"])
             self.scaler.load_state_dict(checkpoint["scaler"])
@@ -86,7 +108,7 @@ class G2_MonoDepth:
             # sobel grad
             loss_rgrad = self.grad_function(sta_depth, sta_gt, hole_gt)
 
-            loss = loss_adepth + loss_rdepth + 0.5 * loss_rgrad
+            loss = 1.5 * loss_adepth + loss_rdepth + 0.8 * loss_rgrad
 
         self.optimizer.zero_grad()
         if self.scaler is not None:
