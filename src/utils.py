@@ -71,11 +71,17 @@ class DDPutils(object):
         dist.init_process_group("nccl", rank=rank, world_size=world_size)
         torch.cuda.set_device(rank)
 
+    # @staticmethod
+    # def run_demo(demo_fn, world_size):
+    #     # demo_fn: name of your main function, like "train"
+    #     # world_size: the number of GPUs
+    #     mp.spawn(demo_fn, args=(world_size,), nprocs=world_size, join=True)
     @staticmethod
-    def run_demo(demo_fn, world_size):
-        # demo_fn: name of your main function, like "train"
+    def run_demo(demo_fn, world_size, *args):
+        # demo_fn: name of your main function
         # world_size: the number of GPUs
-        mp.spawn(demo_fn, args=(world_size,), nprocs=world_size, join=True)
+        # *args: các tham số bổ sung khác
+        mp.spawn(demo_fn, args=(world_size, *args), nprocs=world_size, join=True)
 
     @staticmethod
     def cleanup():

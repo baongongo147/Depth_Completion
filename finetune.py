@@ -67,6 +67,6 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         n_gpus = torch.cuda.device_count()
         print(f"[INFO] Phát hiện {n_gpus} GPU. Đang khởi động Fine-tune...")
-        DDPutils.run_demo(lambda r, w: DDP_finetune(r, w, args), n_gpus)
+        DDPutils.run_demo(DDP_finetune, n_gpus, args)
     else:
         print("[ERROR] Fine-tune yêu cầu GPU có CUDA!")
