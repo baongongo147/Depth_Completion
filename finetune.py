@@ -16,18 +16,6 @@ def parse_arguments():
     )
     # config dataset and pretrained model path
     parser.add_argument(
-        "--rgbd_dir",
-        type=lambda x: Path(x),
-        default=Path("RGBD_Datasets"),
-        help="Path to RGBD folder",
-    )
-    parser.add_argument(
-        "--hole_dir",
-        type=lambda x: Path(x),
-        default=Path("Hole_Datasets"),
-        help="Path to Hole masks folder",
-    )
-    parser.add_argument(
         "--model_dir",
         type=str,
         default="checkpoints/models/epoch_100.pth",
@@ -45,27 +33,27 @@ def parse_arguments():
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1" # Sử dụng 2 GPU T4 trên Kaggle nếu có
 
 def DDP_finetune(rank, world_size, args):
-    # 1. Khởi tạo Config
+    # 1. Khởi tạo Config (các thông số lr, epochs, dataset_dir đã được cấu hình sẵn trong config.py)
     cf = Configs(world_size)
     
-    # 2. Ghi đè cấu hình để Fine-tune
-    cf.rgbd_dirs = args.rgbd_dir
-    cf.hole_dirs = args.hole_dir
+    # 2. Ghi đè đường dẫn checkpoint và save
     cf.save_dir = args.save_dir
-    cf.checkpoint = args.model_dir  # Load trọng số cũ
+    cf.checkpoint = args.model_dir      # Load trọng số cũ
 
     # 3. Thiết lập DDP
     DDPutils.setup(rank, world_size, 6003)
     
     if rank == 0:
-        print(f"--- BẮT ĐẦU FINE-TUNING ---")
-        print(f"Dữ liệu: {cf.rgbd_dirs}")
+        print(f"--- BẮT ĐẦU FINE-TUNING VỚI PRIVATE REAL DATASET ---")
+        print(f"Dữ liệu: {cf.dataset_dir}")
         print(f"Trọng số gốc: {cf.checkpoint}")
+        print(f"Learning rate: {cf.lr}")
+        print(f"Epochs: {cf.epochs}")
         if not args.save_dir.exists():
             args.save_dir.mkdir(parents=True)
 
     # 4. Khởi tạo Trainer
-    # Lưu ý: Class G2_MonoDepth của bạn đã có logic load checkpoint trong __init__
+    # G2_MonoDepth sẽ tự động dùng get_real_dataloader khi cf.dataset_dir được set
     trainer = G2_MonoDepth(cf, rank=rank)
     
     # 5. Bắt đầu Train

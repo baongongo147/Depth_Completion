@@ -10,6 +10,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from .utils import save_img, min_max_norm, print_model_parm_nums, StandardizeData
 from .data_tools import get_dataloader
+from .data_tools_real import get_real_dataloader
 from .losses import (
     WeightedDataLoss,
     WeightedMSGradLoss,
@@ -39,14 +40,25 @@ class G2_MonoDepth:
         )  # create optimizers
         self.network = torch.compile(self.network)  # pytorch 2.0
         # dataloader and datasampler
-        self.loader, self.sampler = get_dataloader(
-            cf.rgbd_dirs,
-            cf.hole_dirs,
-            cf.batch_size,
-            cf.sizes,
-            self.rank,
-            cf.num_workers,
-        )
+        # Nếu có dataset_dir (Private_Real_Dataset) → dùng real dataloader
+        # Nếu không → dùng dataloader gốc (RGBD_Datasets + Hole_Datasets)
+        if hasattr(cf, 'dataset_dir') and cf.dataset_dir is not None:
+            self.loader, self.sampler = get_real_dataloader(
+                cf.dataset_dir,
+                cf.batch_size,
+                cf.sizes,
+                self.rank,
+                cf.num_workers,
+            )
+        else:
+            self.loader, self.sampler = get_dataloader(
+                cf.rgbd_dirs,
+                cf.hole_dirs,
+                cf.batch_size,
+                cf.sizes,
+                self.rank,
+                cf.num_workers,
+            )
         self.iteration_num = len(self.loader)
         # learning rate scheduler: cosine decay
         self.scheduler = CosineAnnealingLR(

@@ -7,6 +7,7 @@ class Configs(object):
         # data configs
         self.rgbd_dirs = Path("RGBD_Datasets")  # RGBD data path
         self.hole_dirs = Path("Hole_Datasets")  # Hole data path
+        self.dataset_dir = Path("Private_Real_Dataset")  # Private Real Dataset path (chứa Rgb/, Depth/, Lidar/)
         self.save_dir = Path("checkpoints")
         self.checkpoint = None  # checkpoint path
 
@@ -24,5 +25,5 @@ class Configs(object):
         self.amp = True  # automatic mixed precision (AMP)
 
         # feedback
-        self.feedback_iteration = 1000
-        self.checkpoint_epoch = 20
+        self.feedback_iteration = 50  # In loss thường xuyên hơn (dataset nhỏ 460 mẫu)
+        self.checkpoint_epoch = 1  # Lưu checkpoint mỗi epoch
