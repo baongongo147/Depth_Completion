@@ -3,10 +3,14 @@ import argparse
 import numpy as np
 import onnxruntime as ort
 import torch # Vẫn cần torch vì RGBPReader trả về tensor
+import torch.nn.functional as F
 from PIL import Image
 from pathlib import Path
 from test_utils import RGBPReader, DepthEvaluation
 import time
+
+# Kích thước mà Model ONNX yêu cầu (cố định khi export)
+TARGET_H, TARGET_W = 320, 448
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
@@ -16,7 +20,7 @@ def parse_arguments():
     parser.add_argument(
         "--rgbd_dir",
         type=lambda x: Path(x),
-        default="Test_Datasets/Ibims",
+        default="Test_Datasets/Private_Real",
         help="Path to RGBD folder",
     )
     parser.add_argument(
@@ -58,10 +62,17 @@ def demo_save_onnx(args):
             # 1. Đọc dữ liệu (trả về Tensor)
             rgb_t, raw_t, hole_raw_t = rgbd_reader.read_data(str_file, raw_path)
             
-            # 2. Xử lý lỗi 5D -> 4D và chuyển sang NumPy
+            # 2. Xử lý lỗi 5D -> 4D
             if rgb_t.dim() == 5: rgb_t = rgb_t[:, :, :, :, 0]
             if raw_t.dim() == 5: raw_t = raw_t[:, :, :, :, 0]
             if hole_raw_t.dim() == 5: hole_raw_t = hole_raw_t[:, :, :, :, 0]
+            
+            # 2.5. Lưu kích thước gốc và resize về kích thước ONNX model yêu cầu
+            orig_h, orig_w = rgb_t.shape[2], rgb_t.shape[3]
+            if orig_h != TARGET_H or orig_w != TARGET_W:
+                rgb_t = F.interpolate(rgb_t, size=(TARGET_H, TARGET_W), mode='bilinear', align_corners=False)
+                raw_t = F.interpolate(raw_t, size=(TARGET_H, TARGET_W), mode='nearest')
+                hole_raw_t = F.interpolate(hole_raw_t, size=(TARGET_H, TARGET_W), mode='nearest')
             
             # Chuyển sang NumPy float32 (ONNX yêu cầu NumPy)
             input_rgb = rgb_t.numpy().astype(np.float32)
@@ -79,8 +90,10 @@ def demo_save_onnx(args):
             onnx_outputs = session.run(None, onnx_inputs)
             pred_np = onnx_outputs[0]
 
-            # 5. Hậu xử lý (Chuyển về tensor để dùng hàm adjust_domain có sẵn)
+            # 5. Hậu xử lý: resize output về kích thước gốc rồi chuyển domain
             pred_tensor = torch.from_numpy(pred_np)
+            if orig_h != TARGET_H or orig_w != TARGET_W:
+                pred_tensor = F.interpolate(pred_tensor, size=(orig_h, orig_w), mode='bilinear', align_corners=False)
             pred_final = rgbd_reader.adjust_domain(pred_tensor)
             
             # 6. Lưu kết quả
