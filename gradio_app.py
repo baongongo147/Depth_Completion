@@ -109,6 +109,32 @@ def resize_to_match(rgb, depth):
     return np.array(depth_img).astype(np.float32) / 65535.0
 
 
+def resize_for_model(rgb_img, sparse_img, target_h=512, target_w=896):
+    """
+    Resize RGB and sparse depth to target size for ONNX/OpenVINO models.
+    Returns resized arrays and original shape for later resizing back.
+    """
+    if isinstance(rgb_img, Image.Image):
+        rgb_np = np.array(rgb_img.convert("RGB"))
+    else:
+        rgb_np = np.array(rgb_img)
+    
+    if isinstance(sparse_img, Image.Image):
+        sparse_np = np.array(sparse_img.convert("I")).astype(np.float32) / 65535.0
+    else:
+        sparse_np = read_depth_image(sparse_img)
+    
+    original_h, original_w = rgb_np.shape[:2]
+    rgb_resized = Image.fromarray(rgb_np).resize((target_w, target_h), resample=Image.BILINEAR)
+    rgb_resized = np.array(rgb_resized)
+    
+    sparse_img_pil = Image.fromarray((sparse_np * 65535.0).astype(np.uint16))
+    sparse_resized = sparse_img_pil.resize((target_w, target_h), resample=Image.NEAREST)
+    sparse_resized = np.array(sparse_resized).astype(np.float32) / 65535.0
+    
+    return rgb_resized, sparse_resized, (original_h, original_w)
+
+
 def pad_to_multiple(tensor, multiple=64):
     _, _, h, w = tensor.shape
     pad_h = (-h) % multiple
@@ -208,7 +234,7 @@ class ModelManager:
             return f"Loaded OpenVINO model: {Path(model_path).name}"
         raise RuntimeError("Unsupported model type")
 
-    def infer(self, rgb_tensor, raw_tensor, hole_tensor):
+    def infer(self, rgb_tensor, raw_tensor, hole_tensor, original_shape=None):
         if self.model_type == ".pth":
             padded_rgb, pad_info = pad_to_multiple(rgb_tensor, 64)
             padded_raw, _ = pad_to_multiple(raw_tensor, 64)
@@ -270,16 +296,36 @@ def infer_pipeline(model_path, input_mode, sample_id, use_fusion, uploaded_rgb, 
                 return None, None, "Cần upload cả RGB và sparse depth", ""
             rgb_img = uploaded_rgb
             sparse_img = uploaded_depth
-        rgb_tensor, raw_tensor, hole_tensor, relative = prepare_model_inputs(rgb_img, sparse_img)
+        
+        model_type = Path(model_path).suffix.lower()
+        if model_type in {".onnx", ".xml"}:
+            rgb_np, sparse_np, original_shape = resize_for_model(rgb_img, sparse_img, target_h=512, target_w=896)
+            rgb_tensor, raw_tensor, hole_tensor, relative = prepare_model_inputs(
+                Image.fromarray(rgb_np),
+                Image.fromarray((sparse_np * 65535.0).astype(np.uint16))
+            )
+        else:
+            rgb_tensor, raw_tensor, hole_tensor, relative = prepare_model_inputs(rgb_img, sparse_img)
+            original_shape = None
+        
         start = time.time()
-        pred_tensor = model_manager.infer(rgb_tensor, raw_tensor, hole_tensor)
+        pred_tensor = model_manager.infer(rgb_tensor, raw_tensor, hole_tensor, original_shape)
         elapsed = time.time() - start
+        
+        if original_shape is not None and model_type in {".onnx", ".xml"}:
+            pred_np = pred_tensor.squeeze().numpy()
+            orig_h, orig_w = original_shape
+            pred_img = Image.fromarray((pred_np * 65535.0).astype(np.uint16))
+            pred_img = pred_img.resize((orig_w, orig_h), resample=Image.NEAREST)
+            pred_tensor = torch.from_numpy(np.array(pred_img).astype(np.float32) / 65535.0).unsqueeze(0).unsqueeze(0)
+        
         depth_uint16 = adjust_domain(pred_tensor, relative)
         depth_img = Image.fromarray(depth_uint16)
         colormap_img = depth_to_colormap(depth_uint16)
         status = f"Inference hoàn thành trong {elapsed:.2f}s"
         return depth_img, colormap_img, status, f"{elapsed:.2f} seconds"
     except Exception as exc:
+        import traceback
         return None, None, f"Lỗi inference: {exc}", ""
 
 
