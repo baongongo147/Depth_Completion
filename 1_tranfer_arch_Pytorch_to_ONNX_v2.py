@@ -16,13 +16,10 @@ def export_and_simplify(model_path, onnx_save_path):
     network.load_state_dict(checkpoint["network"])
     network.eval()
     
-    # Kich thuoc CAMERA_BUFFER_SIZE = (512, 256)
-    # dummy_rgb = torch.randn(1, 3, 256, 512)
-    # dummy_raw = torch.randn(1, 1, 256, 512)
-    # dummy_hole = torch.randn(1, 1, 256, 512)
-    dummy_rgb = torch.randn(1, 3, 320, 448)
-    dummy_raw = torch.randn(1, 1, 320, 448)
-    dummy_hole = torch.randn(1, 1, 320, 448)
+    # Kích thước ảnh thật: 848x480 -> Padding lên bội số 64 gần nhất: 896x512
+    dummy_rgb = torch.randn(1, 3, 512, 896)
+    dummy_raw = torch.randn(1, 1, 512, 896)
+    dummy_hole = torch.randn(1, 1, 512, 896)
     
     print(f"----------- Step 1: Exporting Raw ONNX -----------")
     
@@ -51,9 +48,9 @@ def export_and_simplify(model_path, onnx_save_path):
     model_simp, check = simplify(
         onnx_model,
         overwrite_input_shapes={
-            'rgb': [1, 3, 320, 448], 
-            'raw': [1, 1, 320, 448], 
-            'hole_raw': [1, 1, 320, 448]
+            'rgb': [1, 3, 512, 896], 
+            'raw': [1, 1, 512, 896], 
+            'hole_raw': [1, 1, 512, 896]
         }
     )
     
