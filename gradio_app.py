@@ -11,6 +11,21 @@ from PIL import Image
 import gradio as gr
 
 try:
+    from picamera2 import Picamera2
+except ImportError:
+    Picamera2 = None
+
+try:
+    from rplidar import RPLidar
+except ImportError:
+    RPLidar = None
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
+try:
     import onnxruntime as ort
 except ImportError:
     ort = None
@@ -50,6 +65,90 @@ def scan_test_ids(dataset_dir=DATASET_DIR):
     for file in sorted(rgb_dir.glob("*_rgb.png")):
         ids.append(file.stem.replace("_rgb", ""))
     return ids
+
+
+DEFAULT_LIDAR_PORT = "COM3" if os.name == "nt" else "/dev/ttyUSB0"
+
+
+def is_live_capture_supported():
+    return Picamera2 is not None and RPLidar is not None and cv2 is not None
+
+
+def load_camera_lidar_calibration(calib_path=ROOT / "picam3_calib.npz", extrin_path=ROOT / "extrinsics.npz"):
+    if not calib_path.exists() or not extrin_path.exists():
+        raise FileNotFoundError(
+            "Không tìm thấy file calibration Picamera2/RPLIDAR. Hãy đặt picam3_calib.npz và extrinsics.npz trong thư mục app."
+        )
+    calib = np.load(calib_path)
+    extrin = np.load(extrin_path)
+    return calib["mtx"], calib["dist"], extrin["t"], extrin["r"]
+
+
+def capture_picamera2_rgb(target_size=(640, 480)):
+    if Picamera2 is None:
+        raise RuntimeError("Picamera2 chưa được cài đặt hoặc không tìm thấy trên hệ thống.")
+    picam2 = Picamera2()
+    config = picam2.create_preview_configuration(
+        main={"format": "RGB888", "size": target_size}
+    )
+    picam2.configure(config)
+    picam2.start()
+    try:
+        frame = picam2.capture_array()
+    finally:
+        picam2.stop()
+    return frame
+
+
+def capture_rplidar_scan(port=DEFAULT_LIDAR_PORT):
+    if RPLidar is None:
+        raise RuntimeError("RPLidar chưa được cài đặt hoặc không tìm thấy trên hệ thống.")
+    lidar = RPLidar(port)
+    try:
+        scan = next(lidar.iter_scans(max_buf_meas=1000))
+        return scan
+    finally:
+        try:
+            lidar.stop()
+            lidar.disconnect()
+        except Exception:
+            pass
+
+
+def angle_distance_to_lidar_xz(angle_deg, distance_mm):
+    rad = np.deg2rad(angle_deg)
+    x = np.sin(rad) * distance_mm
+    z = np.cos(rad) * distance_mm
+    return x, z
+
+
+def project_lidar_to_image(scan, K, dist_coeffs, rvec, tvec, image_shape):
+    if cv2 is None:
+        raise RuntimeError("OpenCV chưa được cài đặt, cần để xử lý LiDAR projection.")
+    visible_points = []
+    for quality, angle, distance in scan:
+        if distance <= 0 or not np.isfinite(distance):
+            continue
+        x, z = angle_distance_to_lidar_xz(angle, distance)
+        lidar_pos = np.array([[x, 0.0, z]], dtype=np.float32)
+        img_pts, _ = cv2.projectPoints(lidar_pos, rvec, tvec, K, dist_coeffs)
+        u, v = img_pts.ravel()
+        if not np.isfinite(u) or not np.isfinite(v):
+            continue
+        ix = int(round(u))
+        iy = int(round(v))
+        if 0 <= ix < image_shape[1] and 0 <= iy < image_shape[0]:
+            visible_points.append((ix, iy, distance))
+    return visible_points
+
+
+def build_sparse_depth_from_lidar_points(image_shape, visible_points):
+    h, w = image_shape[:2]
+    sparse = np.zeros((h, w), dtype=np.float32)
+    for x, y, distance in visible_points:
+        if 0 <= x < w and 0 <= y < h:
+            sparse[y, x] = float(distance) / 65535.0
+    return Image.fromarray((sparse * 65535.0).astype(np.uint16))
 
 
 def build_sparse_depth_from_lidar(gt_depth, lidar_json_path):
@@ -278,25 +377,15 @@ MODEL_OPTIONS = scan_models()
 TEST_IDS = scan_test_ids()
 
 
-def infer_pipeline(model_path, input_mode, sample_id, use_fusion, uploaded_rgb, uploaded_depth):
+def run_model_inference(rgb_img, sparse_img, model_path):
     if model_path is None or model_path == "":
         return None, None, "Chưa chọn model", ""
     if model_manager.model_path != model_path:
         try:
-            status = model_manager.load(model_path)
+            model_manager.load(model_path)
         except Exception as exc:
             return None, None, f"Không load được model: {exc}", ""
     try:
-        if input_mode == "Dataset sample":
-            if sample_id is None or sample_id == "":
-                return None, None, "Chưa chọn sample dataset", ""
-            rgb_img, sparse_img = load_dataset_sample(sample_id, use_fusion)
-        else:
-            if uploaded_rgb is None or uploaded_depth is None:
-                return None, None, "Cần upload cả RGB và sparse depth", ""
-            rgb_img = uploaded_rgb
-            sparse_img = uploaded_depth
-        
         model_type = Path(model_path).suffix.lower()
         if model_type in {".onnx", ".xml"}:
             rgb_np, sparse_np, original_shape = resize_for_model(rgb_img, sparse_img, target_h=512, target_w=896)
@@ -307,30 +396,66 @@ def infer_pipeline(model_path, input_mode, sample_id, use_fusion, uploaded_rgb, 
         else:
             rgb_tensor, raw_tensor, hole_tensor, relative = prepare_model_inputs(rgb_img, sparse_img)
             original_shape = None
-        
+
         start = time.time()
         pred_tensor = model_manager.infer(rgb_tensor, raw_tensor, hole_tensor, original_shape)
         elapsed = time.time() - start
-        
+
         if original_shape is not None and model_type in {".onnx", ".xml"}:
             pred_np = pred_tensor.squeeze().numpy()
             orig_h, orig_w = original_shape
             pred_img = Image.fromarray((pred_np * 65535.0).astype(np.uint16))
             pred_img = pred_img.resize((orig_w, orig_h), resample=Image.NEAREST)
             pred_tensor = torch.from_numpy(np.array(pred_img).astype(np.float32) / 65535.0).unsqueeze(0).unsqueeze(0)
-        
+
         depth_uint16 = adjust_domain(pred_tensor, relative)
         depth_img = Image.fromarray(depth_uint16)
         colormap_img = depth_to_colormap(depth_uint16)
         status = f"Inference hoàn thành trong {elapsed:.2f}s"
         return depth_img, colormap_img, status, f"{elapsed:.2f} seconds"
     except Exception as exc:
-        import traceback
         return None, None, f"Lỗi inference: {exc}", ""
 
 
+def live_infer_pipeline(model_path):
+    if model_path is None or model_path == "":
+        return None, None, "Chưa chọn model", ""
+    if not is_live_capture_supported():
+        missing = []
+        if Picamera2 is None:
+            missing.append("Picamera2")
+        if RPLidar is None:
+            missing.append("RPLidar")
+        if cv2 is None:
+            missing.append("OpenCV")
+        return None, None, f"Live capture không khả dụng: thiếu {' ,'.join(missing)}", ""
+    try:
+        K, dist_coeffs, tvec, rvec = load_camera_lidar_calibration()
+    except Exception as exc:
+        return None, None, f"Không load calibration: {exc}", ""
+    try:
+        rgb_frame = capture_picamera2_rgb()
+        lidar_scan = capture_rplidar_scan()
+        visible_points = project_lidar_to_image(rgb_frame.shape, K, dist_coeffs, rvec, tvec, lidar_scan)
+        if len(visible_points) == 0:
+            return None, None, "Không phát hiện điểm LiDAR tương ứng trên ảnh", ""
+        sparse_img = build_sparse_depth_from_lidar_points(rgb_frame.shape, visible_points)
+        rgb_img = Image.fromarray(rgb_frame)
+        return run_model_inference(rgb_img, sparse_img, model_path)
+    except Exception as exc:
+        return None, None, f"Live capture error: {exc}", ""
+
+
+def infer_pipeline(model_path, uploaded_rgb, uploaded_depth):
+    if model_path is None or model_path == "":
+        return None, None, "Chưa chọn model", ""
+    if uploaded_rgb is None or uploaded_depth is None:
+        return None, None, "Cần upload cả RGB và sparse depth", ""
+    return run_model_inference(uploaded_rgb, uploaded_depth, model_path)
+
+
 def main():
-    with gr.Blocks(title="Depth Completion Gradio App", theme=gr.themes.Soft(primary_hue="teal")) as demo:
+    with gr.Blocks(title="Depth Completion Gradio App") as demo:
         gr.Markdown(
             "# Depth Completion Inference App\n"
             "Sử dụng RGB + dữ liệu sparse depth từ LiDAR để tạo depth map hoàn chỉnh."
@@ -338,34 +463,36 @@ def main():
 
         with gr.Row():
             model_selector = gr.Dropdown(label="Chọn model", choices=MODEL_OPTIONS, value=MODEL_OPTIONS[0] if MODEL_OPTIONS else None)
-            model_info = gr.Textbox(label="Model status", interactive=False)
 
-        with gr.Row():
-            input_mode = gr.Radio(label="Chế độ input", choices=["Dataset sample", "Direct upload"], value="Dataset sample")
+        with gr.Tabs():
+            with gr.Tab("Live capture"):
+                live_button = gr.Button("🚀 Capture & Inference")
+                gr.Markdown("*Chụp ảnh trực tiếp từ Pi Camera và ánh xạ LiDAR bằng RPLIDAR.*")
 
-        with gr.Tab("Dataset sample"):
-            sample_id = gr.Dropdown(label="Chọn sample ID", choices=TEST_IDS, value=TEST_IDS[0] if TEST_IDS else None)
-            use_fusion = gr.Checkbox(label="Dùng RGB-fusion nếu có", value=False)
-            gr.Markdown("*Dữ liệu sparse depth được tạo tự động từ `Private_Test_Datasets/Lidar` và `Depth` theo tọa độ LiDAR.*")
+            with gr.Tab("Direct upload"):
+                uploaded_rgb = gr.Image(label="Upload RGB image", type="pil")
+                uploaded_depth = gr.Image(label="Upload sparse depth image", type="pil")
+                direct_button = gr.Button("🚀 Inference từ upload")
+                gr.Markdown("*Upload RGB và sparse depth map đã chuẩn bị sẵn.*")
 
-        with gr.Tab("Direct upload"):
-            uploaded_rgb = gr.Image(label="Upload RGB image", type="pil")
-            uploaded_depth = gr.Image(label="Upload sparse depth image", type="pil")
-            gr.Markdown("*Upload sâu sparse depth map từ LiDAR dạng grayscale PNG 16-bit hoặc 8-bit.*")
-
-        run_button = gr.Button("🚀 Chạy inference")
         output_depth = gr.Image(label="Predicted depth map", type="pil")
         output_colormap = gr.Image(label="Predicted colormap", type="pil")
         status = gr.Textbox(label="Trạng thái", interactive=False)
         elapsed = gr.Textbox(label="Inference time", interactive=False)
 
-        run_button.click(
-            fn=infer_pipeline,
-            inputs=[model_selector, input_mode, sample_id, use_fusion, uploaded_rgb, uploaded_depth],
+        live_button.click(
+            fn=live_infer_pipeline,
+            inputs=[model_selector],
             outputs=[output_depth, output_colormap, status, elapsed],
         )
 
-    demo.launch(server_name="0.0.0.0", share=False)
+        direct_button.click(
+            fn=infer_pipeline,
+            inputs=[model_selector, uploaded_rgb, uploaded_depth],
+            outputs=[output_depth, output_colormap, status, elapsed],
+        )
+
+    demo.launch(server_name="localhost", share=False, theme=gr.themes.Soft(primary_hue="teal"))
 
 
 if __name__ == "__main__":
