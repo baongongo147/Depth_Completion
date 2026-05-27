@@ -15,14 +15,16 @@ def export_and_simplify(model_path, onnx_save_path):
     checkpoint = torch.load(model_path, map_location=device)
     network.load_state_dict(checkpoint["network"])
     network.eval()
-    
-    # Kich thuoc CAMERA_BUFFER_SIZE = (512, 256)
-    # dummy_rgb = torch.randn(1, 3, 256, 512)
-    # dummy_raw = torch.randn(1, 1, 256, 512)
-    # dummy_hole = torch.randn(1, 1, 256, 512)
-    dummy_rgb = torch.randn(1, 3, 320, 448)
-    dummy_raw = torch.randn(1, 1, 320, 448)
-    dummy_hole = torch.randn(1, 1, 320, 448)
+
+    # Original size = (320, 448)
+    # dummy_rgb = torch.randn(1, 3, 320, 448)
+    # dummy_raw = torch.randn(1, 1, 320, 448)
+    # dummy_hole = torch.randn(1, 1, 320, 448)
+
+    # Real Dataset size = (512, 896)
+    dummy_rgb = torch.randn(1, 3, 512, 896)
+    dummy_raw = torch.randn(1, 1, 512, 896)
+    dummy_hole = torch.randn(1, 1, 512, 896)
     
     print(f"----------- Step 1: Exporting Raw ONNX -----------")
     
@@ -51,9 +53,12 @@ def export_and_simplify(model_path, onnx_save_path):
     model_simp, check = simplify(
         onnx_model,
         overwrite_input_shapes={
-            'rgb': [1, 3, 320, 448], 
-            'raw': [1, 1, 320, 448], 
-            'hole_raw': [1, 1, 320, 448]
+            # 'rgb': [1, 3, 320, 448], 
+            # 'raw': [1, 1, 320, 448], 
+            # 'hole_raw': [1, 1, 320, 448]
+            'rgb': [1, 3, 512, 896], 
+            'raw': [1, 1, 512, 896], 
+            'hole_raw': [1, 1, 512, 896]
         }
     )
     
@@ -71,7 +76,7 @@ def export_and_simplify(model_path, onnx_save_path):
     print(f"Kích thước file đã được tối ưu.")
 
 if __name__ == "__main__":
-    MODEL_DIR = "checkpoints/models/epoch_100.pth"
-    ONNX_PATH = "checkpoints/models/g2_monodepth.onnx"
+    MODEL_DIR = "checkpoints/models/epoch_30.pth"
+    ONNX_PATH = "checkpoints/models/g2_monodepth_epoch_30.onnx"
     
     export_and_simplify(MODEL_DIR, ONNX_PATH)
