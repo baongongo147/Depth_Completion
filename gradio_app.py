@@ -6,9 +6,11 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw
 
 import gradio as gr
+import queue
+import threading
 
 try:
     from picamera2 import Picamera2
@@ -36,8 +38,10 @@ except ImportError:
     ov = None
 
 try:
+    import matplotlib
     import matplotlib.cm as cm
 except ImportError:
+    matplotlib = None
     cm = None
 
 from src.networks import UNet
@@ -97,19 +101,62 @@ def capture_picamera2_rgb(target_size=(640, 480)):
         frame = picam2.capture_array()
     finally:
         picam2.stop()
+        picam2.close()
     return frame
 
 
-def capture_rplidar_scan(port=DEFAULT_LIDAR_PORT):
+def capture_rplidar_scan(port=DEFAULT_LIDAR_PORT, timeout=10.0):
     if RPLidar is None:
         raise RuntimeError("RPLidar chưa được cài đặt hoặc không tìm thấy trên hệ thống.")
-    lidar = RPLidar(port)
+    lidar = RPLidar(port, baudrate=115200, timeout=3)
     try:
-        scan = next(lidar.iter_scans(max_buf_meas=1000))
-        return scan
+        lidar.get_info()
+        lidar.get_health()
+
+        # Start motor and wait for it to stabilize
+        if hasattr(lidar, "start_motor"):
+            lidar.start_motor()
+        time.sleep(3.0)
+
+        # Flush stale data from serial buffer to prevent "Wrong body size" error
+        serial_obj = getattr(lidar, "_serial", None) or getattr(lidar, "_serial_port", None)
+        if serial_obj and hasattr(serial_obj, "reset_input_buffer"):
+            serial_obj.reset_input_buffer()
+        if hasattr(lidar, "clean_input"):
+            lidar.clean_input()
+
+        scan_result = queue.Queue()
+
+        def scan_worker():
+            try:
+                scan = next(lidar.iter_scans(max_buf_meas=1000))
+                scan_result.put(("ok", scan))
+            except Exception as exc:
+                scan_result.put(("err", exc))
+
+        worker = threading.Thread(target=scan_worker, daemon=True)
+        worker.start()
+
+        try:
+            status, payload = scan_result.get(timeout=timeout)
+        except queue.Empty:
+            raise RuntimeError(f"RPLidar scan timeout after {timeout:.1f}s")
+
+        if status == "err":
+            raise payload
+
+        return payload
     finally:
         try:
             lidar.stop()
+        except Exception:
+            pass
+        if hasattr(lidar, "stop_motor"):
+            try:
+                lidar.stop_motor()
+            except Exception:
+                pass
+        try:
             lidar.disconnect()
         except Exception:
             pass
@@ -125,12 +172,28 @@ def angle_distance_to_lidar_xz(angle_deg, distance_mm):
 def project_lidar_to_image(scan, K, dist_coeffs, rvec, tvec, image_shape):
     if cv2 is None:
         raise RuntimeError("OpenCV chưa được cài đặt, cần để xử lý LiDAR projection.")
+
+    K = np.asarray(K, dtype=np.float64).reshape(3, 3)
+    dist_coeffs = np.asarray(dist_coeffs, dtype=np.float64)
+    if dist_coeffs.ndim == 1:
+        dist_coeffs = dist_coeffs.reshape(-1, 1)
+
+    rvec = np.asarray(rvec, dtype=np.float64)
+    if rvec.shape == (3, 3):
+        rvec, _ = cv2.Rodrigues(rvec)
+    if rvec.ndim == 1:
+        rvec = rvec.reshape(3, 1)
+
+    tvec = np.asarray(tvec, dtype=np.float64)
+    if tvec.ndim == 1:
+        tvec = tvec.reshape(3, 1)
+
     visible_points = []
     for quality, angle, distance in scan:
         if distance <= 0 or not np.isfinite(distance):
             continue
         x, z = angle_distance_to_lidar_xz(angle, distance)
-        lidar_pos = np.array([[x, 0.0, z]], dtype=np.float32)
+        lidar_pos = np.array([[x, 0.0, z]], dtype=np.float64)
         img_pts, _ = cv2.projectPoints(lidar_pos, rvec, tvec, K, dist_coeffs)
         u, v = img_pts.ravel()
         if not np.isfinite(u) or not np.isfinite(v):
@@ -140,6 +203,32 @@ def project_lidar_to_image(scan, K, dist_coeffs, rvec, tvec, image_shape):
         if 0 <= ix < image_shape[1] and 0 <= iy < image_shape[0]:
             visible_points.append((ix, iy, distance))
     return visible_points
+
+
+def draw_lidar_overlay(rgb_frame, visible_points, point_radius=4):
+    """Draw LiDAR points on the RGB image with distance-based coloring."""
+    overlay = Image.fromarray(rgb_frame).copy()
+    if not visible_points:
+        return overlay
+
+    distances = [d for _, _, d in visible_points]
+    d_min, d_max = min(distances), max(distances)
+    d_range = d_max - d_min if d_max - d_min > 1e-3 else 1.0
+
+    draw = ImageDraw.Draw(overlay)
+    for x, y, dist in visible_points:
+        # Normalize distance: close=red, far=blue
+        t = (dist - d_min) / d_range
+        r = int(255 * (1.0 - t))
+        g = int(255 * max(0.0, 1.0 - abs(t - 0.5) * 2))
+        b = int(255 * t)
+        color = (r, g, b)
+        draw.ellipse(
+            [x - point_radius, y - point_radius, x + point_radius, y + point_radius],
+            fill=color,
+            outline=(255, 255, 255),
+        )
+    return overlay
 
 
 def build_sparse_depth_from_lidar_points(image_shape, visible_points):
@@ -217,20 +306,20 @@ def resize_for_model(rgb_img, sparse_img, target_h=512, target_w=896):
         rgb_np = np.array(rgb_img.convert("RGB"))
     else:
         rgb_np = np.array(rgb_img)
-    
+
     if isinstance(sparse_img, Image.Image):
         sparse_np = np.array(sparse_img.convert("I")).astype(np.float32) / 65535.0
     else:
         sparse_np = read_depth_image(sparse_img)
-    
+
     original_h, original_w = rgb_np.shape[:2]
     rgb_resized = Image.fromarray(rgb_np).resize((target_w, target_h), resample=Image.BILINEAR)
     rgb_resized = np.array(rgb_resized)
-    
+
     sparse_img_pil = Image.fromarray((sparse_np * 65535.0).astype(np.uint16))
     sparse_resized = sparse_img_pil.resize((target_w, target_h), resample=Image.NEAREST)
     sparse_resized = np.array(sparse_resized).astype(np.float32) / 65535.0
-    
+
     return rgb_resized, sparse_resized, (original_h, original_w)
 
 
@@ -262,7 +351,8 @@ def depth_to_colormap(depth_uint16):
         gray = (depth_uint16 / 256).astype(np.uint8)
         return Image.fromarray(gray).convert("RGB")
     depth_norm = depth_uint16.astype(np.float32) / 65535.0
-    rgba = cm.get_cmap("turbo")(depth_norm)
+    cmap = matplotlib.colormaps.get_cmap("turbo")
+    rgba = cmap(depth_norm)
     rgb = (rgba[:, :, :3] * 255).astype(np.uint8)
     return Image.fromarray(rgb)
 
@@ -409,7 +499,7 @@ def run_model_inference(rgb_img, sparse_img, model_path):
             pred_tensor = torch.from_numpy(np.array(pred_img).astype(np.float32) / 65535.0).unsqueeze(0).unsqueeze(0)
 
         depth_uint16 = adjust_domain(pred_tensor, relative)
-        depth_img = Image.fromarray(depth_uint16)
+        depth_img = Image.fromarray((depth_uint16 // 256).astype(np.uint8))
         colormap_img = depth_to_colormap(depth_uint16)
         status = f"Inference hoàn thành trong {elapsed:.2f}s"
         return depth_img, colormap_img, status, f"{elapsed:.2f} seconds"
@@ -418,8 +508,12 @@ def run_model_inference(rgb_img, sparse_img, model_path):
 
 
 def live_infer_pipeline(model_path):
+    """Capture RGB + LiDAR, show preview, then run inference."""
+    # Returns: (captured_rgb, lidar_overlay, depth_map, colormap, status, elapsed)
+    empty = (None, None, None, None, "", "")
+
     if model_path is None or model_path == "":
-        return None, None, "Chưa chọn model", ""
+        return (*empty[:4], "Chưa chọn model", "")
     if not is_live_capture_supported():
         missing = []
         if Picamera2 is None:
@@ -428,22 +522,39 @@ def live_infer_pipeline(model_path):
             missing.append("RPLidar")
         if cv2 is None:
             missing.append("OpenCV")
-        return None, None, f"Live capture không khả dụng: thiếu {' ,'.join(missing)}", ""
+        return (*empty[:4], f"Live capture không khả dụng: thiếu {', '.join(missing)}", "")
+
     try:
         K, dist_coeffs, tvec, rvec = load_camera_lidar_calibration()
     except Exception as exc:
-        return None, None, f"Không load calibration: {exc}", ""
+        return (*empty[:4], f"Không load calibration: {exc}", "")
+
     try:
+        # Capture RGB frame
         rgb_frame = capture_picamera2_rgb()
+        captured_rgb = Image.fromarray(rgb_frame)
+
+        # Capture LiDAR scan
         lidar_scan = capture_rplidar_scan()
-        visible_points = project_lidar_to_image(rgb_frame.shape, K, dist_coeffs, rvec, tvec, lidar_scan)
+
+        # Project LiDAR points onto image
+        visible_points = project_lidar_to_image(lidar_scan, K, dist_coeffs, rvec, tvec, rgb_frame.shape)
+
+        # Draw LiDAR overlay
+        lidar_overlay = draw_lidar_overlay(rgb_frame, visible_points)
+
         if len(visible_points) == 0:
-            return None, None, "Không phát hiện điểm LiDAR tương ứng trên ảnh", ""
+            return captured_rgb, lidar_overlay, None, None, "Không phát hiện điểm LiDAR tương ứng trên ảnh", ""
+
+        # Build sparse depth and run inference
         sparse_img = build_sparse_depth_from_lidar_points(rgb_frame.shape, visible_points)
-        rgb_img = Image.fromarray(rgb_frame)
-        return run_model_inference(rgb_img, sparse_img, model_path)
+        depth_img, colormap_img, status, elapsed = run_model_inference(captured_rgb, sparse_img, model_path)
+        n_pts = len(visible_points)
+        status = f"Capture: {rgb_frame.shape[1]}x{rgb_frame.shape[0]}, {n_pts} LiDAR points | {status}"
+        return captured_rgb, lidar_overlay, depth_img, colormap_img, status, elapsed
+
     except Exception as exc:
-        return None, None, f"Live capture error: {exc}", ""
+        return (*empty[:4], f"Live capture error: {exc}", "")
 
 
 def infer_pipeline(model_path, uploaded_rgb, uploaded_depth):
@@ -468,28 +579,36 @@ def main():
             with gr.Tab("Live capture"):
                 live_button = gr.Button("🚀 Capture & Inference")
                 gr.Markdown("*Chụp ảnh trực tiếp từ Pi Camera và ánh xạ LiDAR bằng RPLIDAR.*")
+                with gr.Row():
+                    live_captured_rgb = gr.Image(label="Captured RGB", type="pil")
+                    live_lidar_overlay = gr.Image(label="RGB + LiDAR overlay", type="pil")
+                with gr.Row():
+                    live_depth = gr.Image(label="Predicted depth map", type="pil")
+                    live_colormap = gr.Image(label="Predicted colormap", type="pil")
+                live_status = gr.Textbox(label="Trạng thái", interactive=False)
+                live_elapsed = gr.Textbox(label="Inference time", interactive=False)
 
             with gr.Tab("Direct upload"):
                 uploaded_rgb = gr.Image(label="Upload RGB image", type="pil")
                 uploaded_depth = gr.Image(label="Upload sparse depth image", type="pil")
                 direct_button = gr.Button("🚀 Inference từ upload")
                 gr.Markdown("*Upload RGB và sparse depth map đã chuẩn bị sẵn.*")
-
-        output_depth = gr.Image(label="Predicted depth map", type="pil")
-        output_colormap = gr.Image(label="Predicted colormap", type="pil")
-        status = gr.Textbox(label="Trạng thái", interactive=False)
-        elapsed = gr.Textbox(label="Inference time", interactive=False)
+                with gr.Row():
+                    direct_depth = gr.Image(label="Predicted depth map", type="pil")
+                    direct_colormap = gr.Image(label="Predicted colormap", type="pil")
+                direct_status = gr.Textbox(label="Trạng thái", interactive=False)
+                direct_elapsed = gr.Textbox(label="Inference time", interactive=False)
 
         live_button.click(
             fn=live_infer_pipeline,
             inputs=[model_selector],
-            outputs=[output_depth, output_colormap, status, elapsed],
+            outputs=[live_captured_rgb, live_lidar_overlay, live_depth, live_colormap, live_status, live_elapsed],
         )
 
         direct_button.click(
             fn=infer_pipeline,
             inputs=[model_selector, uploaded_rgb, uploaded_depth],
-            outputs=[output_depth, output_colormap, status, elapsed],
+            outputs=[direct_depth, direct_colormap, direct_status, direct_elapsed],
         )
 
     demo.launch(server_name="localhost", share=False, theme=gr.themes.Soft(primary_hue="teal"))
