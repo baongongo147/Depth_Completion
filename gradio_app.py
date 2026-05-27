@@ -299,8 +299,9 @@ def resize_to_match(rgb, depth):
 
 def resize_for_model(rgb_img, sparse_img, target_h=512, target_w=896):
     """
-    Resize RGB and sparse depth to target size for ONNX/OpenVINO models.
-    Returns resized arrays and original shape for later resizing back.
+    Process RGB and sparse depth to target size for ONNX/OpenVINO models.
+    Pads if the input image can fit into the target size, otherwise resizes.
+    Returns processed arrays, original shape, and the mode ('pad' or 'resize').
     """
     if isinstance(rgb_img, Image.Image):
         rgb_np = np.array(rgb_img.convert("RGB"))
@@ -313,14 +314,27 @@ def resize_for_model(rgb_img, sparse_img, target_h=512, target_w=896):
         sparse_np = read_depth_image(sparse_img)
 
     original_h, original_w = rgb_np.shape[:2]
-    rgb_resized = Image.fromarray(rgb_np).resize((target_w, target_h), resample=Image.BILINEAR)
-    rgb_resized = np.array(rgb_resized)
 
-    sparse_img_pil = Image.fromarray((sparse_np * 65535.0).astype(np.uint16))
-    sparse_resized = sparse_img_pil.resize((target_w, target_h), resample=Image.NEAREST)
-    sparse_resized = np.array(sparse_resized).astype(np.float32) / 65535.0
+    # If the input image is smaller than or equal to the target size, pad it to preserve LiDAR coordinates
+    if original_h <= target_h and original_w <= target_w:
+        pad_bottom = target_h - original_h
+        pad_right = target_w - original_w
+        if cv2 is not None:
+            rgb_processed = cv2.copyMakeBorder(rgb_np, 0, pad_bottom, 0, pad_right, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+            sparse_processed = cv2.copyMakeBorder(sparse_np, 0, pad_bottom, 0, pad_right, cv2.BORDER_CONSTANT, value=0.0)
+        else:
+            rgb_processed = np.pad(rgb_np, ((0, pad_bottom), (0, pad_right), (0, 0)), mode='constant')
+            sparse_processed = np.pad(sparse_np, ((0, pad_bottom), (0, pad_right)), mode='constant')
+        return rgb_processed, sparse_processed, (original_h, original_w), "pad"
+    else:
+        # Fallback to resizing if the input image doesn't fit in the target shape
+        rgb_resized = Image.fromarray(rgb_np).resize((target_w, target_h), resample=Image.BILINEAR)
+        rgb_resized = np.array(rgb_resized)
 
-    return rgb_resized, sparse_resized, (original_h, original_w)
+        sparse_img_pil = Image.fromarray((sparse_np * 65535.0).astype(np.uint16))
+        sparse_resized = sparse_img_pil.resize((target_w, target_h), resample=Image.NEAREST)
+        sparse_resized = np.array(sparse_resized).astype(np.float32) / 65535.0
+        return rgb_resized, sparse_resized, (original_h, original_w), "resize"
 
 
 def pad_to_multiple(tensor, multiple=64):
@@ -413,14 +427,32 @@ class ModelManager:
             if ort is None:
                 raise RuntimeError("onnxruntime is not installed")
             self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
-            return f"Loaded ONNX model: {Path(model_path).name}"
+            # Auto-detect shape
+            try:
+                input_shape = self.session.get_inputs()[0].shape
+                self.target_h = input_shape[2]
+                self.target_w = input_shape[3]
+            except Exception as e:
+                print(f"Không tự động phát hiện được kích thước model ONNX: {e}")
+                self.target_h = 512
+                self.target_w = 640  # Mặc định mới cho Raspberry Pi Camera
+            return f"Loaded ONNX model: {Path(model_path).name} with shape {self.target_w}x{self.target_h}"
         if self.model_type == ".xml":
             if ov is None:
                 raise RuntimeError("openvino is not installed")
             core = ov.Core()
             model = core.read_model(model=model_path)
             self.compiled = core.compile_model(model=model, device_name="CPU")
-            return f"Loaded OpenVINO model: {Path(model_path).name}"
+            # Auto-detect shape
+            try:
+                input_shape = self.compiled.inputs[0].shape
+                self.target_h = input_shape[2]
+                self.target_w = input_shape[3]
+            except Exception as e:
+                print(f"Không tự động phát hiện được kích thước model OpenVINO: {e}")
+                self.target_h = 512
+                self.target_w = 640  # Mặc định mới cho Raspberry Pi Camera
+            return f"Loaded OpenVINO model: {Path(model_path).name} with shape {self.target_w}x{self.target_h}"
         raise RuntimeError("Unsupported model type")
 
     def infer(self, rgb_tensor, raw_tensor, hole_tensor, original_shape=None):
@@ -478,7 +510,9 @@ def run_model_inference(rgb_img, sparse_img, model_path):
     try:
         model_type = Path(model_path).suffix.lower()
         if model_type in {".onnx", ".xml"}:
-            rgb_np, sparse_np, original_shape = resize_for_model(rgb_img, sparse_img, target_h=512, target_w=896)
+            target_h = getattr(model_manager, 'target_h', 512)
+            target_w = getattr(model_manager, 'target_w', 640)
+            rgb_np, sparse_np, original_shape, mode = resize_for_model(rgb_img, sparse_img, target_h=target_h, target_w=target_w)
             rgb_tensor, raw_tensor, hole_tensor, relative = prepare_model_inputs(
                 Image.fromarray(rgb_np),
                 Image.fromarray((sparse_np * 65535.0).astype(np.uint16))
@@ -486,6 +520,7 @@ def run_model_inference(rgb_img, sparse_img, model_path):
         else:
             rgb_tensor, raw_tensor, hole_tensor, relative = prepare_model_inputs(rgb_img, sparse_img)
             original_shape = None
+            mode = None
 
         start = time.time()
         pred_tensor = model_manager.infer(rgb_tensor, raw_tensor, hole_tensor, original_shape)
@@ -494,9 +529,14 @@ def run_model_inference(rgb_img, sparse_img, model_path):
         if original_shape is not None and model_type in {".onnx", ".xml"}:
             pred_np = pred_tensor.squeeze().numpy()
             orig_h, orig_w = original_shape
-            pred_img = Image.fromarray((pred_np * 65535.0).astype(np.uint16))
-            pred_img = pred_img.resize((orig_w, orig_h), resample=Image.NEAREST)
-            pred_tensor = torch.from_numpy(np.array(pred_img).astype(np.float32) / 65535.0).unsqueeze(0).unsqueeze(0)
+            if mode == "pad":
+                # Crop back the padded region
+                pred_np = pred_np[0:orig_h, 0:orig_w]
+                pred_tensor = torch.from_numpy(pred_np).unsqueeze(0).unsqueeze(0)
+            else:
+                pred_img = Image.fromarray((pred_np * 65535.0).astype(np.uint16))
+                pred_img = pred_img.resize((orig_w, orig_h), resample=Image.NEAREST)
+                pred_tensor = torch.from_numpy(np.array(pred_img).astype(np.float32) / 65535.0).unsqueeze(0).unsqueeze(0)
 
         depth_uint16 = adjust_domain(pred_tensor, relative)
         depth_img = Image.fromarray((depth_uint16 // 256).astype(np.uint8))
