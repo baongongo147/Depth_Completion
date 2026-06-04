@@ -179,12 +179,15 @@ def project_lidar_to_image(scan, K, dist_coeffs, rvec, tvec, image_shape):
         dist_coeffs = dist_coeffs.reshape(-1, 1)
 
     rvec = np.asarray(rvec, dtype=np.float64)
-    if rvec.shape == (3, 3):
-        rvec, _ = cv2.Rodrigues(rvec)
-    if rvec.ndim == 1:
-        rvec = rvec.reshape(3, 1)
-
     tvec = np.asarray(tvec, dtype=np.float64)
+    
+    if rvec.shape == (3, 3):
+        R = rvec
+        rvec_3x1, _ = cv2.Rodrigues(rvec)
+    else:
+        R, _ = cv2.Rodrigues(rvec)
+        rvec_3x1 = rvec.reshape(3, 1)
+
     if tvec.ndim == 1:
         tvec = tvec.reshape(3, 1)
 
@@ -193,15 +196,28 @@ def project_lidar_to_image(scan, K, dist_coeffs, rvec, tvec, image_shape):
         if distance <= 0 or not np.isfinite(distance):
             continue
         x, z = angle_distance_to_lidar_xz(angle, distance)
-        lidar_pos = np.array([[x, 0.0, z]], dtype=np.float64)
-        img_pts, _ = cv2.projectPoints(lidar_pos, rvec, tvec, K, dist_coeffs)
+        
+        # Tọa độ 3D trong hệ quy chiếu LiDAR (Y = 0)
+        lidar_pos = np.array([x, 0.0, z], dtype=np.float64)
+        
+        # Chuyển sang hệ quy chiếu camera
+        P_camera = R.dot(lidar_pos) + tvec.squeeze()
+        Z_c = P_camera[2] # Thành phần Z thực tế trong hệ camera (Planar Depth)
+        
+        # Skip nếu điểm nằm phía sau camera
+        if Z_c <= 0 or not np.isfinite(Z_c):
+            continue
+
+        # Chiếu điểm lên ảnh phẳng
+        img_pts, _ = cv2.projectPoints(lidar_pos.reshape(1, 1, 3), rvec_3x1, tvec, K, dist_coeffs)
         u, v = img_pts.ravel()
         if not np.isfinite(u) or not np.isfinite(v):
             continue
         ix = int(round(u))
         iy = int(round(v))
         if 0 <= ix < image_shape[1] and 0 <= iy < image_shape[0]:
-            visible_points.append((ix, iy, distance))
+            # Sử dụng Z_c (chiều sâu phẳng) thay vì khoảng cách radial xiên
+            visible_points.append((ix, iy, Z_c))
     return visible_points
 
 
@@ -606,7 +622,28 @@ def infer_pipeline(model_path, uploaded_rgb, uploaded_depth):
 
 
 def main():
-    with gr.Blocks(title="Depth Completion Gradio App") as demo:
+    # JavaScript lắng nghe phím Space để kích hoạt nút Capture
+    head_html = """
+    <script>
+    document.addEventListener("keydown", function(e) {
+        // Tránh kích hoạt khi người dùng đang gõ vào các ô nhập liệu
+        if (document.activeElement.tagName === "INPUT" || document.activeElement.tagName === "TEXTAREA") {
+            return;
+        }
+        if (e.code === "Space") {
+            e.preventDefault();
+            // Tìm nút Capture & Inference và click
+            const buttons = Array.from(document.querySelectorAll("button"));
+            const captureBtn = buttons.find(btn => btn.textContent.includes("Capture & Inference") || btn.textContent.includes("Capture"));
+            if (captureBtn) {
+                captureBtn.click();
+            }
+        }
+    });
+    </script>
+    """
+
+    with gr.Blocks(title="Depth Completion Gradio App", head=head_html) as demo:
         gr.Markdown(
             "# Depth Completion Inference App\n"
             "Sử dụng RGB + dữ liệu sparse depth từ LiDAR để tạo depth map hoàn chỉnh."
@@ -617,7 +654,7 @@ def main():
 
         with gr.Tabs():
             with gr.Tab("Live capture"):
-                live_button = gr.Button("🚀 Capture & Inference")
+                live_button = gr.Button("Capture & Inference")
                 gr.Markdown("*Chụp ảnh trực tiếp từ Pi Camera và ánh xạ LiDAR bằng RPLIDAR.*")
                 with gr.Row():
                     live_captured_rgb = gr.Image(label="Captured RGB", type="pil")
