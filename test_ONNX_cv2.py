@@ -13,10 +13,15 @@ def parse_arguments():
     return parser.parse_args()
 
 # --- KÍCH THƯỜC ẢNH THẬT VÀ PADDING ---
-# Ảnh gốc: 848x480 (WxH) -> Padding lên bội số 64 gần nhất: 896x512
-ORIG_H, ORIG_W = 480, 848
+# Ảnh Dataset gốc: 848x480 (WxH) -> Padding lên bội số 64 gần nhất: 896x512
+# ORIG_H, ORIG_W = 480, 848
+# PAD_BOTTOM = 32   # 512 - 480 = 32
+# PAD_RIGHT  = 48   # 896 - 848 = 48
+
+# Ảnh Target camera gốc: 640x480 (WxH) -> Padding lên bội số 64 gần nhất: 640x512
+ORIG_H, ORIG_W = 480, 640
 PAD_BOTTOM = 32   # 512 - 480 = 32
-PAD_RIGHT  = 48   # 896 - 848 = 48
+PAD_RIGHT  = 0    # 640 - 640 = 0
 
 # --- REPLACEMENT FOR RGBPReader (NUMPY ONLY) ---
 def prepare_input(rgb_path, raw_path):

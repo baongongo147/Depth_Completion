@@ -21,10 +21,15 @@ def export_and_simplify(model_path, onnx_save_path):
     # dummy_raw = torch.randn(1, 1, 320, 448)
     # dummy_hole = torch.randn(1, 1, 320, 448)
 
-    # Real Dataset size = (512, 896)
-    dummy_rgb = torch.randn(1, 3, 512, 896)
-    dummy_raw = torch.randn(1, 1, 512, 896)
-    dummy_hole = torch.randn(1, 1, 512, 896)
+    # Real Dataset size = (640, 480) -> padded to (512, 896)
+    # dummy_rgb = torch.randn(1, 3, 512, 896)
+    # dummy_raw = torch.randn(1, 1, 512, 896)
+    # dummy_hole = torch.randn(1, 1, 512, 896)
+
+    # Target camera size = (640, 480) -> padded to (512, 640)
+    dummy_rgb = torch.randn(1, 3, 512, 640)
+    dummy_raw = torch.randn(1, 1, 512, 640)
+    dummy_hole = torch.randn(1, 1, 512, 640)
     
     print(f"----------- Step 1: Exporting Raw ONNX -----------")
     
@@ -56,9 +61,12 @@ def export_and_simplify(model_path, onnx_save_path):
             # 'rgb': [1, 3, 320, 448], 
             # 'raw': [1, 1, 320, 448], 
             # 'hole_raw': [1, 1, 320, 448]
-            'rgb': [1, 3, 512, 896], 
-            'raw': [1, 1, 512, 896], 
-            'hole_raw': [1, 1, 512, 896]
+            # 'rgb': [1, 3, 512, 896], 
+            # 'raw': [1, 1, 512, 896], 
+            # 'hole_raw': [1, 1, 512, 896]
+            'rgb': [1, 3, 512, 640], 
+            'raw': [1, 1, 512, 640], 
+            'hole_raw': [1, 1, 512, 640]
         }
     )
     
