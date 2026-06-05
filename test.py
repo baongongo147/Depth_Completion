@@ -28,7 +28,7 @@ def parse_arguments():
     parser.add_argument(
         "--rgbd_dir",
         type=lambda x: Path(x),
-        default="Test_Datasets/Ibims",
+        default="Test_Datasets/Private_Test",
         help="Path to RGBD folder",
     )
     parser.add_argument(
@@ -39,6 +39,18 @@ def parse_arguments():
     )
     args = parser.parse_args()
     return args
+
+
+def pad_to_multiple(tensor, multiple=64):
+    """Pad tensor (N,C,H,W) so H and W are multiples of `multiple`."""
+    _, _, h, w = tensor.shape
+    pad_h = (multiple - h % multiple) % multiple
+    pad_w = (multiple - w % multiple) % multiple
+    if pad_h == 0 and pad_w == 0:
+        return tensor, h, w
+    # pad order: (left, right, top, bottom)
+    tensor = torch.nn.functional.pad(tensor, (0, pad_w, 0, pad_h), mode='reflect')
+    return tensor, h, w
 
 
 def demo_save(args):
@@ -61,7 +73,13 @@ def demo_save(args):
                     raw = raw[:, :, :, :, 0] # Lấy kênh đầu tiên trong 3 kênh màu
                 if hole_raw.dim() == 5:
                     hole_raw = hole_raw[:, :, :, :, 0]
-                pred = network(rgb.to(device), raw.to(device), hole_raw.to(device))
+                # Pad inputs to multiple of 64 for UNet compatibility
+                rgb_pad, orig_h, orig_w = pad_to_multiple(rgb, 64)
+                raw_pad, _, _ = pad_to_multiple(raw, 64)
+                hole_raw_pad, _, _ = pad_to_multiple(hole_raw, 64)
+                pred = network(rgb_pad.to(device), raw_pad.to(device), hole_raw_pad.to(device))
+                # Crop back to original size
+                pred = pred[:, :, :orig_h, :orig_w]
                 pred = rgbd_reader.adjust_domain(pred)
                 # # save img
                 os.makedirs(str(Path(save_path).parent), exist_ok=True)
@@ -82,8 +100,13 @@ def demo_metric(args):
             count += 1.0
 
             str_file = str(file)
-            pred_path = str_file.replace("/rgb/", "/result_" + raw_dir + "/")
-            gt_path = str_file.replace("/rgb/", "/gt/")
+            
+            rgb_p = f"{os.sep}rgb{os.sep}"
+            res_p = f"{os.sep}result_{raw_dir}{os.sep}"
+            gt_p  = f"{os.sep}gt{os.sep}"
+            
+            pred_path = str_file.replace(rgb_p, res_p)
+            gt_path = str_file.replace(rgb_p, gt_p)
             # depth should be nonzero
             pred = np.clip(
                 np.array(Image.open(pred_path)).astype(np.float32), 1.0, 65535.0
