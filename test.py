@@ -34,7 +34,7 @@ def parse_arguments():
     parser.add_argument(
         "--model_dir",
         type=lambda x: Path(x),
-        default="checkpoints/models/epoch_100.pth",
+        default="checkpoints/models/epoch_30.pth",
         help="Path to load models",
     )
     args = parser.parse_args()

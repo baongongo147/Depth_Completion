@@ -41,7 +41,15 @@ class FirstModule(Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        x1 = torch.cat((x, self.block(x)), dim=1)
+        x2 = self.block(x)
+        if x2.shape[2:] != x.shape[2:]:
+            x2 = torch.nn.functional.interpolate(
+                x2,
+                size=x.shape[2:],
+                mode='bilinear',
+                align_corners=False,
+            )
+        x1 = torch.cat((x, x2), dim=1)
         return x1
 
 
@@ -64,5 +72,13 @@ class UNetModule(Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        x1 = torch.cat((x, self.block(x)), dim=1)
+        x2 = self.block(x)
+        if x2.shape[2:] != x.shape[2:]:
+            x2 = torch.nn.functional.interpolate(
+                x2,
+                size=x.shape[2:],
+                mode='bilinear',
+                align_corners=False,
+            )
+        x1 = torch.cat((x, x2), dim=1)
         return x1
