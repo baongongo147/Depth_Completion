@@ -6,7 +6,7 @@ from pathlib import Path
 # Load module dynamically to support files starting with numbers
 spec = importlib.util.spec_from_file_location(
     "transfer_v2", 
-    Path(__file__).parent / "1_tranfer_arch_Pytorch_to_ONNX_v2.py"
+    Path(__file__).parent / "tranfer_arch_Pytorch_to_ONNX.py"
 )
 transfer_v2 = importlib.util.module_from_spec(spec)
 sys.modules["transfer_v2"] = transfer_v2

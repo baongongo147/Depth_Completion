@@ -60,12 +60,17 @@ def demo_save(args):
     # raw_dirs = ["0%", "1%", "100%"]
     raw_dirs = ["1%"]
     print("-----------inferring---------------")
+    # Prepare output folder based on model name
+    model_name = Path(args.model_dir).stem
+    base_save_dir = args.rgbd_dir / f"result_{model_name}"
     for raw_dir in raw_dirs:
         with torch.no_grad():
             for file in (args.rgbd_dir / "rgb").rglob("*.png"):
                 str_file = str(file)
+                # relative path under rgb folder
+                rel_path = Path(file).relative_to(args.rgbd_dir / "rgb")
                 raw_path = str_file.replace(os.sep + "rgb" + os.sep, os.sep + "raw_" + raw_dir + os.sep)
-                save_path = str_file.replace(os.sep + "rgb" + os.sep, os.sep + "result_" + raw_dir + os.sep)
+                save_path = str(base_save_dir / raw_dir / rel_path)
                 rgbd_reader = RGBPReader()
                 # processing
                 rgb, raw, hole_raw = rgbd_reader.read_data(str_file, raw_path)
@@ -96,17 +101,18 @@ def demo_metric(args):
         rmse = 0.0
         rel = 0.0
         count = 0.0
+        # Use same output folder naming as demo_save
+        model_name = Path(args.model_dir).stem
+        base_save_dir = args.rgbd_dir / f"result_{model_name}"
+
         for file in (args.rgbd_dir / "rgb").rglob("*.png"):
             count += 1.0
 
             str_file = str(file)
-            
-            rgb_p = f"{os.sep}rgb{os.sep}"
-            res_p = f"{os.sep}result_{raw_dir}{os.sep}"
-            gt_p  = f"{os.sep}gt{os.sep}"
-            
-            pred_path = str_file.replace(rgb_p, res_p)
-            gt_path = str_file.replace(rgb_p, gt_p)
+            rel_path = Path(file).relative_to(args.rgbd_dir / "rgb")
+
+            pred_path = str(base_save_dir / raw_dir / rel_path)
+            gt_path = str_file.replace(os.sep + "rgb" + os.sep, os.sep + "gt" + os.sep)
             # depth should be nonzero
             pred = np.clip(
                 np.array(Image.open(pred_path)).astype(np.float32), 1.0, 65535.0

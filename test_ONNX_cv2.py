@@ -19,6 +19,7 @@ def parse_arguments():
 # PAD_RIGHT  = 48   # 896 - 848 = 48
 
 # Ảnh Target camera gốc: 640x480 (WxH) -> Padding lên bội số 64 gần nhất: 640x512
+# Ảnh Dataset gốc: 848x480 (WxH) -> Resize về Target camera 640x480 rồi padding lên 640x512
 ORIG_H, ORIG_W = 480, 640
 PAD_BOTTOM = 32   # 512 - 480 = 32
 PAD_RIGHT  = 0    # 640 - 640 = 0
@@ -28,8 +29,9 @@ def prepare_input(rgb_path, raw_path):
     # Đọc ảnh RGB bằng OpenCV (Nhanh hơn PIL)
     rgb = cv2.imread(str(rgb_path))
     rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+    rgb = cv2.resize(rgb, (ORIG_W, ORIG_H), interpolation=cv2.INTER_LINEAR)
     
-    # Padding viền đen thay vì Resize (để giữ nguyên tọa độ LiDAR)
+    # Padding viền đen theo kích thước ONNX model
     rgb = cv2.copyMakeBorder(rgb, top=0, bottom=PAD_BOTTOM, left=0, right=PAD_RIGHT,
                              borderType=cv2.BORDER_CONSTANT, value=(0, 0, 0))
         
@@ -39,6 +41,7 @@ def prepare_input(rgb_path, raw_path):
 
     # Đọc ảnh Raw (Depth)
     raw = cv2.imread(str(raw_path), cv2.IMREAD_UNCHANGED)
+    raw = cv2.resize(raw, (ORIG_W, ORIG_H), interpolation=cv2.INTER_NEAREST)
     # Padding viền đen cho ảnh Depth (giá trị 0 = không có dữ liệu LiDAR)
     raw = cv2.copyMakeBorder(raw, top=0, bottom=PAD_BOTTOM, left=0, right=PAD_RIGHT,
                              borderType=cv2.BORDER_CONSTANT, value=0)
@@ -137,6 +140,7 @@ def run_inference():
         if gt_path.exists():
             gt = cv2.imread(str(gt_path), cv2.IMREAD_UNCHANGED)
             if gt is not None:
+                gt = cv2.resize(gt, (ORIG_W, ORIG_H), interpolation=cv2.INTER_NEAREST)
                 gt = gt.astype(np.float32)
                 pred_eval = result.astype(np.float32)
                 
