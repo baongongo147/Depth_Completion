@@ -178,12 +178,9 @@ def export_and_simplify(model_path, onnx_save_path, engine_save_path):
     print(f"Export thành công! File: {onnx_save_path}")
     print(f"Opset version: {final_model.opset_import[0].version}")
     print(f"Kích thước file đã được tối ưu.")
-    import gc
 
     del network
     del checkpoint
-
-    gc.collect()
 
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
