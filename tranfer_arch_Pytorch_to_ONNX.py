@@ -37,7 +37,15 @@ def build_tensorrt_engine(onnx_path, engine_path, fp16=True):
     config = builder.create_builder_config()
 
     # Cấu hình bộ nhớ Workspace (Ví dụ: cấp 2GB để TRT lựa chọn kernel tối ưu nhất)
-    workspace_size = 2 * (1024 ** 30)  # 2 GB
+    # Ghi số trực tiếp vì để phép nhân gây lỗi 
+    # workspace_size = 2 * (1024 ** 30)  # 2 GB
+    # try:
+    #     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_size)
+    # except AttributeError:
+    #     # Hỗ trợ các phiên bản cũ của TensorRT (< 8.4)
+    #     config.max_workspace_size = workspace_size
+
+    workspace_size = 2147483648  # 2 GB
     try:
         config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_size)
     except AttributeError:
@@ -170,6 +178,15 @@ def export_and_simplify(model_path, onnx_save_path, engine_save_path):
     print(f"Export thành công! File: {onnx_save_path}")
     print(f"Opset version: {final_model.opset_import[0].version}")
     print(f"Kích thước file đã được tối ưu.")
+    import gc
+
+    del network
+    del checkpoint
+
+    gc.collect()
+
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
 
     # --- BƯỚC 3: BIÊN DỊCH SANG TENSORRT ENGINE ---
     build_tensorrt_engine(onnx_save_path, engine_save_path, fp16=True)
