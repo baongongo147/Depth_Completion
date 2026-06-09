@@ -34,12 +34,18 @@ def main():
             continue
             
         onnx_name = f"g2_monodepth_epoch_{epoch}.onnx"
+        engine_name = f"g2_monodepth_epoch_{epoch}.engine"
         onnx_path = models_dir / onnx_name
+        engine_path = models_dir / engine_name
         
-        print(f"\n[XỬ LÝ] Chuyển đổi: {pth_name} -> {onnx_name}...")
+        print(f"\n[XỬ LÝ] Chuyển đổi: {pth_name} -> {onnx_name} và {engine_name}...")
         try:
-            transfer_v2.export_and_simplify(str(pth_path), str(onnx_path))
-            print(f"[OK] Đã lưu {onnx_name}")
+            transfer_v2.export_and_simplify(
+                str(pth_path),
+                str(onnx_path),
+                str(engine_path)
+            )
+            print(f"[OK] Đã lưu {onnx_name} và {engine_name}")
         except Exception as e:
             print(f"[LỖI] Không thể chuyển đổi {pth_name}: {e}")
 
