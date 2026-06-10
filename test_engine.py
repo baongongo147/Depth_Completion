@@ -1,5 +1,7 @@
+from multiprocessing import context
 import os
 import cv2
+from httpcore import stream
 import numpy as np
 import argparse
 import time
@@ -109,24 +111,58 @@ def load_engine(engine_path):
     return engine
 
 
+# def allocate_buffers(engine):
+#     inputs = []
+#     outputs = []
+#     bindings = []
+#     stream = cuda.Stream()
+
+#     for binding_idx in range(engine.num_bindings):
+#         name = engine.get_binding_name(binding_idx)
+#         dtype = trt.nptype(engine.get_binding_dtype(binding_idx))
+#         shape = engine.get_binding_shape(binding_idx)
+#         if any(dim < 0 for dim in shape):
+#             shape = tuple(1 if dim < 0 else dim for dim in shape)
+#         size = trt.volume(shape)
+
+#         host_mem = cuda.pagelocked_empty(size, dtype)
+#         device_mem = cuda.mem_alloc(host_mem.nbytes)
+
+#         bindings.append(int(device_mem))
+#         tensor = {
+#             "name": name,
+#             "dtype": dtype,
+#             "shape": shape,
+#             "host": host_mem,
+#             "device": device_mem,
+#         }
+
+#         if engine.binding_is_input(binding_idx):
+#             inputs.append(tensor)
+#         else:
+#             outputs.append(tensor)
+
+#     return inputs, outputs, bindings, stream
+
 def allocate_buffers(engine):
     inputs = []
     outputs = []
     bindings = []
     stream = cuda.Stream()
 
-    for binding_idx in range(engine.num_bindings):
-        name = engine.get_binding_name(binding_idx)
-        dtype = trt.nptype(engine.get_binding_dtype(binding_idx))
-        shape = engine.get_binding_shape(binding_idx)
-        if any(dim < 0 for dim in shape):
-            shape = tuple(1 if dim < 0 else dim for dim in shape)
+    for i in range(engine.num_io_tensors):
+        name = engine.get_tensor_name(i)
+        dtype = trt.nptype(
+            engine.get_tensor_dtype(name)
+        )
+
+        shape = engine.get_tensor_shape(name)
+
         size = trt.volume(shape)
 
         host_mem = cuda.pagelocked_empty(size, dtype)
         device_mem = cuda.mem_alloc(host_mem.nbytes)
 
-        bindings.append(int(device_mem))
         tensor = {
             "name": name,
             "dtype": dtype,
@@ -135,13 +171,14 @@ def allocate_buffers(engine):
             "device": device_mem,
         }
 
-        if engine.binding_is_input(binding_idx):
+        bindings.append(int(device_mem))
+
+        if engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
             inputs.append(tensor)
         else:
             outputs.append(tensor)
 
     return inputs, outputs, bindings, stream
-
 
 def infer_with_engine(context, inputs, outputs, bindings, stream, input_arrays):
     for tensor, array in zip(inputs, input_arrays):
@@ -156,7 +193,22 @@ def infer_with_engine(context, inputs, outputs, bindings, stream, input_arrays):
         flat_host[:] = array.ravel()
         cuda.memcpy_htod_async(tensor["device"], tensor["host"], stream)
 
-    context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
+    # context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
+    for tensor in inputs:
+        context.set_tensor_address(
+            tensor["name"],
+            int(tensor["device"])
+        )
+
+    for tensor in outputs:
+        context.set_tensor_address(
+            tensor["name"],
+            int(tensor["device"])
+        )
+
+    context.execute_async_v3(
+        stream_handle=stream.handle
+    )
 
     for out in outputs:
         cuda.memcpy_dtoh_async(out["host"], out["device"], stream)
