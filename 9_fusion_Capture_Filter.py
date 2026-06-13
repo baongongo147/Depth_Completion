@@ -1,12 +1,11 @@
 import cv2
 import numpy as np
 from rplidar import RPLidar
-import pyrealsense2 as rs
 import math
 import os
 import time
 import json
-
+from Realsense_Stream import RealSenseOptimize
 import common
  
 SAVE_ROOT = "dataset"
@@ -20,7 +19,7 @@ for d in [SAVE_ROOT, RGB_DIR, RGB_FUSION_DIR, DEPTH_DIR, LIDAR_DIR]:
 
 START_INDEX = 1   
 MIN_DEPTH = 150      # mm
-MAX_DEPTH = 10000    # mm
+MAX_DEPTH = 7000    # mm
 
 def depth_to_color(depth_mm):
     depth_clipped = np.clip(depth_mm, MIN_DEPTH, MAX_DEPTH)
@@ -99,34 +98,16 @@ def main():
 
     global rvec
     global tvec
+   
+    # ===== REALSENSE INIT =====
 
-    # ===== REALSENSE INIT (RGB + DEPTH ALIGNED) =====
-    pipeline = rs.pipeline()
-    config = rs.config()
-
-    # RGB stream
-    config.enable_stream(
-        rs.stream.color,
-        common.CAMERA_BUFFER_SIZE[0],
-        common.CAMERA_BUFFER_SIZE[1],
-        rs.format.bgr8,
-        15
+    camera = RealSenseOptimize(
+        width=common.CAMERA_BUFFER_SIZE[0],
+        height=common.CAMERA_BUFFER_SIZE[1],
+        fps=15
     )
 
-    # Depth stream (16bit mm)
-    config.enable_stream(
-        rs.stream.depth,
-        common.CAMERA_BUFFER_SIZE[0],
-        common.CAMERA_BUFFER_SIZE[1],
-        rs.format.z16,
-        15
-    )
-
-    pipeline.start(config)
-
-    # ⭐ CỰC KỲ QUAN TRỌNG: align depth -> color
-    align = rs.align(rs.stream.color)
-    
+    profile = camera.profile
 
     cv2.namedWindow('Camera', cv2.WINDOW_NORMAL)
     cv2.namedWindow('Lidar', cv2.WINDOW_NORMAL)
@@ -145,16 +126,10 @@ def main():
             try:
                 scan_generator = lidar.iter_scans(max_buf_meas=10000)
                 for scan in scan_generator:
-                    frames = pipeline.wait_for_frames()
-                    aligned_frames = align.process(frames)
-                    
-                    color_frame = aligned_frames.get_color_frame()
-                    depth_frame = aligned_frames.get_depth_frame()
-                    if not color_frame or not depth_frame:
-                        continue
+                    raw_rgb, depth_image = camera.get_frames()
 
-                    raw_rgb = np.asanyarray(color_frame.get_data())
-                    depth_image = np.asanyarray(depth_frame.get_data())
+                    if raw_rgb is None:
+                        continue
                     
                     rgb_frame = raw_rgb.copy()       # ảnh gốc
                     fusion_frame = raw_rgb.copy()    # ảnh để vẽ lidar
@@ -311,7 +286,7 @@ def main():
             except Exception as e:
                 if not run_flag:
                     break
-                print("\n🔥 LIDAR CRASH:", e)
+                print("\nLIDAR CRASH:", e)
                 print("Reconnecting in 2 seconds...")
 
                 try:
@@ -324,7 +299,7 @@ def main():
                 lidar = connect_lidar()
 
     finally:
-        pipeline.stop()
+        camera.stop()
         lidar.stop()
         lidar.disconnect()
         cv2.destroyAllWindows()
