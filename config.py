@@ -27,3 +27,6 @@ class Configs(object):
         # feedback
         self.feedback_iteration = 50  # In loss thường xuyên hơn (dataset nhỏ 460 mẫu)
         self.checkpoint_epoch = 1  # Lưu checkpoint mỗi epoch
+
+        # finetune mode
+        self.finetune = False  # Set True khi fine-tune (chỉ load weights, không load optimizer/scheduler)

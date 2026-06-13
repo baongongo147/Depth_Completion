@@ -39,6 +39,7 @@ def DDP_finetune(rank, world_size, args):
     # 2. Ghi đè đường dẫn checkpoint và save
     cf.save_dir = args.save_dir
     cf.checkpoint = args.model_dir      # Load trọng số cũ
+    cf.finetune = True                  # Chỉ load weights, không load optimizer/scheduler
 
     # 3. Thiết lập DDP
     DDPutils.setup(rank, world_size, 6003)
