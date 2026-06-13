@@ -17,9 +17,9 @@ LIDAR_DIR = os.path.join(SAVE_ROOT, "lidar")
 for d in [SAVE_ROOT, RGB_DIR, RGB_FUSION_DIR, DEPTH_DIR, LIDAR_DIR]:
     os.makedirs(d, exist_ok=True)
 
-START_INDEX = 1   
-MIN_DEPTH = 150      # mm
-MAX_DEPTH = 7000    # mm
+START_INDEX = 622   
+MIN_DEPTH = 100      # 100mm = 10cm
+MAX_DEPTH = 7000    # 7000mm = 7m
 
 def depth_to_color(depth_mm):
     depth_clipped = np.clip(depth_mm, MIN_DEPTH, MAX_DEPTH)
@@ -117,7 +117,13 @@ def main():
     cv2.namedWindow('Depth', cv2.WINDOW_NORMAL)
     cv2.setWindowProperty('Depth', cv2.WND_PROP_ASPECT_RATIO, cv2.WINDOW_KEEPRATIO)
     # cv2.resizeWindow('Depth', 1280, 720)
+    cv2.namedWindow('Depth16', cv2.WINDOW_NORMAL)
 
+    cv2.setWindowProperty(
+        'Depth16',
+        cv2.WND_PROP_ASPECT_RATIO,
+        cv2.WINDOW_KEEPRATIO
+    )
     print(f"Detected Camera FOV: {cam_fov_h:.2f} degrees")
     lidar = connect_lidar()
     run_flag = True    
@@ -138,10 +144,16 @@ def main():
                     #     cv2.convertScaleAbs(depth_image, alpha=0.03),
                     #     cv2.COLORMAP_JET
                     # )
+
                     depth_clipped = np.clip(depth_image, MIN_DEPTH, MAX_DEPTH)
+
                     depth_8bit = ((depth_clipped - MIN_DEPTH) / (MAX_DEPTH - MIN_DEPTH) * 255).astype(np.uint8)
                     depth_colormap = cv2.applyColorMap(depth_8bit, cv2.COLORMAP_JET)
+                    # Depth grayscale
+                    depth_gray = depth_8bit.copy()
+
                     cv2.imshow("Depth", depth_colormap)
+                    cv2.imshow("Depth16", depth_gray)
 
                     radar_view = np.zeros((common.LIDAR_VIEW_SIZE[0], common.LIDAR_VIEW_SIZE[1], 3), dtype=np.uint8)
                     radar_ruler_color = (50, 50, 50)
