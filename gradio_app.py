@@ -44,6 +44,26 @@ except ImportError:
     matplotlib = None
     cm = None
 
+try:
+    import pyrealsense2 as rs
+except ImportError:
+    rs = None
+
+import base64
+import io
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+# Global variable to store latest data received from Pi 5
+LATEST_PI5_DATA = {
+    "rgb": None,
+    "lidar_overlay": None,
+    "sparse_depth": None,
+    "timestamp": 0.0,
+    "status": "Chưa nhận được dữ liệu từ Pi 5"
+}
+LATEST_PI5_LOCK = threading.Lock()
+
+
 from src.networks import UNet
 
 ROOT = Path(__file__).resolve().parent
@@ -563,54 +583,168 @@ def run_model_inference(rgb_img, sparse_img, model_path):
         return None, None, f"Lỗi inference: {exc}", ""
 
 
+class Pi5DataReceiver(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        return
+
+    def do_POST(self):
+        if self.path == "/update_data":
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            try:
+                data = json.loads(post_data.decode('utf-8'))
+                
+                rgb_b64 = data.get("rgb")
+                lidar_data = data.get("lidar") # Raw RPLidar scan
+                sparse_b64 = data.get("sparse") # Optional pre-projected sparse depth
+                
+                rgb_img = None
+                if rgb_b64:
+                    rgb_bytes = base64.b64decode(rgb_b64)
+                    rgb_img = Image.open(io.BytesIO(rgb_bytes)).convert("RGB")
+                
+                sparse_img = None
+                if sparse_b64:
+                    sparse_bytes = base64.b64decode(sparse_b64)
+                    sparse_img = Image.open(io.BytesIO(sparse_bytes)).convert("I")
+                
+                lidar_overlay_img = None
+                if rgb_img is not None:
+                    rgb_np = np.array(rgb_img)
+                    if lidar_data is not None:
+                        try:
+                            K, dist_coeffs, tvec, rvec = load_camera_lidar_calibration()
+                            visible_points = project_lidar_to_image(lidar_data, K, dist_coeffs, rvec, tvec, rgb_np.shape)
+                            lidar_overlay_img = draw_lidar_overlay(rgb_np, visible_points)
+                            sparse_img = build_sparse_depth_from_lidar_points(rgb_np.shape, visible_points)
+                        except Exception as e:
+                            print(f"Lỗi project LiDAR trên PC: {e}")
+                            lidar_overlay_img = rgb_img
+                    elif sparse_img is not None:
+                        # Draw overlay from sparse depth map
+                        sparse_np = np.array(sparse_img)
+                        ys, xs = np.where(sparse_np > 0)
+                        visible_points = [(x, y, float(sparse_np[y, x])) for x, y in zip(xs, ys)]
+                        lidar_overlay_img = draw_lidar_overlay(rgb_np, visible_points)
+                
+                with LATEST_PI5_LOCK:
+                    if rgb_img is not None:
+                        LATEST_PI5_DATA["rgb"] = rgb_img
+                    if lidar_overlay_img is not None:
+                        LATEST_PI5_DATA["lidar_overlay"] = lidar_overlay_img
+                    elif rgb_img is not None:
+                        LATEST_PI5_DATA["lidar_overlay"] = rgb_img
+                    if sparse_img is not None:
+                        LATEST_PI5_DATA["sparse_depth"] = sparse_img
+                    LATEST_PI5_DATA["timestamp"] = time.time()
+                    LATEST_PI5_DATA["status"] = f"Đã nhận dữ liệu mới lúc {time.strftime('%H:%M:%S')}"
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "success"}).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
+def start_pi5_receiver_server(port=5000):
+    server = HTTPServer(('0.0.0.0', port), Pi5DataReceiver)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"HTTP Server nhận dữ liệu Pi 5 đang chạy tại port {port}...")
+
+
+def capture_realsense_frame():
+    if rs is None:
+        raise RuntimeError("Thư viện pyrealsense2 chưa được cài đặt.")
+    pipeline = rs.pipeline()
+    config = rs.config()
+    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    
+    # Start pipeline
+    profile = pipeline.start(config)
+    
+    # Align depth to color stream
+    align_to = rs.stream.color
+    align = rs.align(align_to)
+    
+    try:
+        # Chờ camera ổn định phơi sáng
+        for _ in range(10):
+            pipeline.wait_for_frames()
+            
+        frames = pipeline.wait_for_frames()
+        aligned_frames = align.process(frames)
+        
+        depth_frame = aligned_frames.get_depth_frame()
+        color_frame = aligned_frames.get_color_frame()
+        
+        if not depth_frame or not color_frame:
+            raise RuntimeError("Không lấy được frame từ RealSense")
+            
+        depth_image = np.asanyarray(depth_frame.get_data())
+        color_image = np.asanyarray(color_frame.get_data())
+        
+        color_image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
+        
+        return color_image_rgb, depth_image
+    finally:
+        pipeline.stop()
+
+
 def live_infer_pipeline(model_path):
-    """Capture RGB + LiDAR, show preview, then run inference."""
-    # Returns: (captured_rgb, lidar_overlay, depth_map, colormap, status, elapsed)
-    empty = (None, None, None, None, "", "")
-
+    """Lấy dữ liệu mới nhất nhận được từ Pi 5, đồng thời chụp từ RealSense làm so sánh, rồi chạy inference."""
+    # Trả về: Pi5_RGB, Pi5_Lidar_Overlay, Pred_Depth, Pred_Colormap, RS_RGB, RS_Depth_Colormap, Status, Elapsed
+    empty = (None, None, None, None, None, None, "", "")
     if model_path is None or model_path == "":
-        return (*empty[:4], "Chưa chọn model", "")
-    if not is_live_capture_supported():
-        missing = []
-        if Picamera2 is None:
-            missing.append("Picamera2")
-        if RPLidar is None:
-            missing.append("RPLidar")
-        if cv2 is None:
-            missing.append("OpenCV")
-        return (*empty[:4], f"Live capture không khả dụng: thiếu {', '.join(missing)}", "")
+        return (*empty[:6], "Chưa chọn model", "")
+        
+    with LATEST_PI5_LOCK:
+        rgb = LATEST_PI5_DATA["rgb"]
+        lidar_overlay = LATEST_PI5_DATA["lidar_overlay"]
+        sparse = LATEST_PI5_DATA["sparse_depth"]
+        status_msg = LATEST_PI5_DATA["status"]
+        timestamp = LATEST_PI5_DATA["timestamp"]
+        
+    if rgb is None or sparse is None:
+        return (*empty[:6], f"Chưa có dữ liệu từ Pi 5. Trạng thái hiện tại: {status_msg}", "")
+        
+    age = time.time() - timestamp
+    age_msg = f" (Dữ liệu cũ từ {age:.1f}s trước)" if age > 10 else ""
+    
+    # Thử capture RealSense
+    rs_rgb_img = None
+    rs_colormap_img = None
+    rs_msg = ""
+    if rs is not None:
+        try:
+            rs_rgb_arr, rs_depth_arr = capture_realsense_frame()
+            d_min, d_max = rs_depth_arr.min(), rs_depth_arr.max()
+            if d_max - d_min > 0:
+                depth_scaled = ((rs_depth_arr - d_min) / (d_max - d_min) * 65535.0).astype(np.uint16)
+            else:
+                depth_scaled = np.zeros_like(rs_depth_arr, dtype=np.uint16)
+            rs_colormap_img = depth_to_colormap(depth_scaled)
+            rs_rgb_img = Image.fromarray(rs_rgb_arr)
+            rs_msg = " | RealSense OK"
+        except Exception as e:
+            rs_msg = f" | Lỗi RealSense: {e}"
+    else:
+        rs_msg = " | RealSense không khả dụng"
 
     try:
-        K, dist_coeffs, tvec, rvec = load_camera_lidar_calibration()
+        depth_img, colormap_img, status, elapsed = run_model_inference(rgb, sparse, model_path)
+        status = f"Dữ liệu từ Pi 5{age_msg}{rs_msg} | {status}"
+        return rgb, lidar_overlay, depth_img, colormap_img, rs_rgb_img, rs_colormap_img, status, elapsed
     except Exception as exc:
-        return (*empty[:4], f"Không load calibration: {exc}", "")
-
-    try:
-        # Capture RGB frame
-        rgb_frame = capture_picamera2_rgb()
-        captured_rgb = Image.fromarray(rgb_frame)
-
-        # Capture LiDAR scan
-        lidar_scan = capture_rplidar_scan()
-
-        # Project LiDAR points onto image
-        visible_points = project_lidar_to_image(lidar_scan, K, dist_coeffs, rvec, tvec, rgb_frame.shape)
-
-        # Draw LiDAR overlay
-        lidar_overlay = draw_lidar_overlay(rgb_frame, visible_points)
-
-        if len(visible_points) == 0:
-            return captured_rgb, lidar_overlay, None, None, "Không phát hiện điểm LiDAR tương ứng trên ảnh", ""
-
-        # Build sparse depth and run inference
-        sparse_img = build_sparse_depth_from_lidar_points(rgb_frame.shape, visible_points)
-        depth_img, colormap_img, status, elapsed = run_model_inference(captured_rgb, sparse_img, model_path)
-        n_pts = len(visible_points)
-        status = f"Capture: {rgb_frame.shape[1]}x{rgb_frame.shape[0]}, {n_pts} LiDAR points | {status}"
-        return captured_rgb, lidar_overlay, depth_img, colormap_img, status, elapsed
-
-    except Exception as exc:
-        return (*empty[:4], f"Live capture error: {exc}", "")
+        return (*empty[:6], f"Live capture error: {exc}", "")
 
 
 def infer_pipeline(model_path, uploaded_rgb, uploaded_depth):
@@ -622,19 +756,20 @@ def infer_pipeline(model_path, uploaded_rgb, uploaded_depth):
 
 
 def main():
+    # Khởi chạy HTTP receiver server ở port 5000 nhận dữ liệu từ Pi 5
+    start_pi5_receiver_server(port=5000)
+
     # JavaScript lắng nghe phím Space để kích hoạt nút Capture
     head_html = """
     <script>
     document.addEventListener("keydown", function(e) {
-        // Tránh kích hoạt khi người dùng đang gõ vào các ô nhập liệu
         if (document.activeElement.tagName === "INPUT" || document.activeElement.tagName === "TEXTAREA") {
             return;
         }
         if (e.code === "Space") {
             e.preventDefault();
-            // Tìm nút Capture & Inference và click
             const buttons = Array.from(document.querySelectorAll("button"));
-            const captureBtn = buttons.find(btn => btn.textContent.includes("Capture & Inference") || btn.textContent.includes("Capture"));
+            const captureBtn = buttons.find(btn => btn.textContent.includes("Inference từ Pi 5") || btn.textContent.includes("Capture"));
             if (captureBtn) {
                 captureBtn.click();
             }
@@ -655,13 +790,23 @@ def main():
         with gr.Tabs():
             with gr.Tab("Live capture"):
                 live_button = gr.Button("Capture & Inference")
-                gr.Markdown("*Chụp ảnh trực tiếp từ Pi Camera và ánh xạ LiDAR bằng RPLIDAR.*")
+                gr.Markdown("*Chụp ảnh trực tiếp từ Pi Camera và ánh xạ LiDAR bằng RPLIDAR, đồng thời so sánh với RealSense.*")
+                
+                with gr.Row():
+                    gr.Markdown("### 1. Đầu vào từ Raspberry Pi 5")
                 with gr.Row():
                     live_captured_rgb = gr.Image(label="Captured RGB", type="pil")
                     live_lidar_overlay = gr.Image(label="RGB + LiDAR overlay", type="pil")
+                
+                with gr.Row():
+                    gr.Markdown("### 2. Kết quả dự đoán & Tham chiếu so sánh")
                 with gr.Row():
                     live_depth = gr.Image(label="Predicted depth map", type="pil")
                     live_colormap = gr.Image(label="Predicted colormap", type="pil")
+                with gr.Row():
+                    rs_rgb = gr.Image(label="RealSense RGB", type="pil")
+                    rs_depth_colormap = gr.Image(label="RealSense Depth Colormap", type="pil")
+                
                 live_status = gr.Textbox(label="Trạng thái", interactive=False)
                 live_elapsed = gr.Textbox(label="Inference time", interactive=False)
 
@@ -679,7 +824,7 @@ def main():
         live_button.click(
             fn=live_infer_pipeline,
             inputs=[model_selector],
-            outputs=[live_captured_rgb, live_lidar_overlay, live_depth, live_colormap, live_status, live_elapsed],
+            outputs=[live_captured_rgb, live_lidar_overlay, live_depth, live_colormap, rs_rgb, rs_depth_colormap, live_status, live_elapsed],
         )
 
         direct_button.click(
