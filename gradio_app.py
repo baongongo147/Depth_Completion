@@ -1,6 +1,7 @@
 import json
 import os
 import time
+import math
 from pathlib import Path
 
 import numpy as np
@@ -49,9 +50,14 @@ try:
 except ImportError:
     rs = None
 
+try:
+    import tensorrt as trt
+except ImportError:
+    trt = None
+
 import base64
 import io
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import urllib.request
 
 # Global variable to store latest data received from Pi 5
 LATEST_PI5_DATA = {
@@ -76,7 +82,7 @@ def scan_models(model_dir=MODEL_DIR):
         return []
     models = []
     for path in sorted(model_dir.iterdir()):
-        if path.suffix.lower() in {".pth", ".onnx", ".xml"}:
+        if path.suffix.lower() in {".pth", ".onnx", ".xml", ".engine"}:
             models.append(str(path))
     return models
 
@@ -193,78 +199,91 @@ def project_lidar_to_image(scan, K, dist_coeffs, rvec, tvec, image_shape):
     if cv2 is None:
         raise RuntimeError("OpenCV chưa được cài đặt, cần để xử lý LiDAR projection.")
 
-    K = np.asarray(K, dtype=np.float64).reshape(3, 3)
-    dist_coeffs = np.asarray(dist_coeffs, dtype=np.float64)
-    if dist_coeffs.ndim == 1:
-        dist_coeffs = dist_coeffs.reshape(-1, 1)
-
-    rvec = np.asarray(rvec, dtype=np.float64)
-    tvec = np.asarray(tvec, dtype=np.float64)
+    K = np.asarray(K, dtype=np.float32).reshape(3, 3)
+    dist_coeffs = np.asarray(dist_coeffs, dtype=np.float32)
     
-    if rvec.shape == (3, 3):
-        R = rvec
-        rvec_3x1, _ = cv2.Rodrigues(rvec)
-    else:
-        R, _ = cv2.Rodrigues(rvec)
-        rvec_3x1 = rvec.reshape(3, 1)
-
-    if tvec.ndim == 1:
-        tvec = tvec.reshape(3, 1)
+    # Ensure correct shape for rvec and tvec
+    rvec = np.asarray(rvec, dtype=np.float32)
+    if rvec.size == 9: # 3x3 matrix
+        rvec, _ = cv2.Rodrigues(rvec)
+    rvec = rvec.reshape(3, 1)
+    
+    tvec = np.asarray(tvec, dtype=np.float32).reshape(3, 1)
 
     visible_points = []
-    for quality, angle, distance in scan:
+    lidar_pts = []
+    distances = []
+    
+    for item in scan:
+        if len(item) == 3:
+            quality, angle, distance = item
+        else:
+            angle, distance = item
+            quality = 15
+            
         if distance <= 0 or not np.isfinite(distance):
             continue
-        x, z = angle_distance_to_lidar_xz(angle, distance)
+            
+        # lx, lz from demo logic: lx = distance * sin(angle_rad), lz = distance * cos(angle_rad)
+        rad = math.radians(angle)
+        lx = distance * math.sin(rad)
+        lz = distance * math.cos(rad)
         
-        # Tọa độ 3D trong hệ quy chiếu LiDAR (Y = 0)
-        lidar_pos = np.array([x, 0.0, z], dtype=np.float64)
-        
-        # Chuyển sang hệ quy chiếu camera
-        P_camera = R.dot(lidar_pos) + tvec.squeeze()
-        Z_c = P_camera[2] # Thành phần Z thực tế trong hệ camera (Planar Depth)
-        
-        # Skip nếu điểm nằm phía sau camera
-        if Z_c <= 0 or not np.isfinite(Z_c):
+        # position[2] < 0.0 check from demo: lz < 0
+        if lz < 0.0:
             continue
+            
+        lidar_pts.append([lx, 0.0, lz])
+        distances.append(distance)
 
-        # Chiếu điểm lên ảnh phẳng
-        img_pts, _ = cv2.projectPoints(lidar_pos.reshape(1, 1, 3), rvec_3x1, tvec, K, dist_coeffs)
-        u, v = img_pts.ravel()
-        if not np.isfinite(u) or not np.isfinite(v):
+    if not lidar_pts:
+        return visible_points
+
+    lidar_pts_arr = np.array(lidar_pts, dtype=np.float32)
+    img_pts, _ = cv2.projectPoints(lidar_pts_arr, rvec, tvec, K, dist_coeffs)
+    img_pts = img_pts.reshape(-1, 2)
+
+    height, width = image_shape[:2]
+    for i, pt in enumerate(img_pts):
+        if not np.all(np.isfinite(pt)):
             continue
-        ix = int(round(u))
-        iy = int(round(v))
-        if 0 <= ix < image_shape[1] and 0 <= iy < image_shape[0]:
-            # Sử dụng Z_c (chiều sâu phẳng) thay vì khoảng cách radial xiên
-            visible_points.append((ix, iy, Z_c))
+        x, y = pt
+        ix = int(round(x))
+        iy = int(round(y))
+        if 0 <= ix < width and 0 <= iy < height:
+            visible_points.append((ix, iy, distances[i]))
+            
     return visible_points
 
 
-def draw_lidar_overlay(rgb_frame, visible_points, point_radius=4):
-    """Draw LiDAR points on the RGB image with distance-based coloring."""
+def draw_lidar_overlay(rgb_frame, visible_points, point_radius=1):
+    """Draw LiDAR points on the RGB image with distance-based coloring (Red for near, Blue for far)."""
     overlay = Image.fromarray(rgb_frame).copy()
     if not visible_points:
         return overlay
 
-    distances = [d for _, _, d in visible_points]
-    d_min, d_max = min(distances), max(distances)
-    d_range = d_max - d_min if d_max - d_min > 1e-3 else 1.0
-
     draw = ImageDraw.Draw(overlay)
+    
+    min_dist = 150.0  # mm
+    max_dist = 12000.0  # mm
+    
     for x, y, dist in visible_points:
-        # Normalize distance: close=red, far=blue
-        t = (dist - d_min) / d_range
-        r = int(255 * (1.0 - t))
-        g = int(255 * max(0.0, 1.0 - abs(t - 0.5) * 2))
-        b = int(255 * t)
+        dist_clipped = np.clip(dist, min_dist, max_dist)
+        t = (dist_clipped - min_dist) / (max_dist - min_dist)
+        
+        # Close = Red, Far = Blue (from demo: r = (1-t)*255, b = t*255)
+        r = int((1.0 - t) * 255)
+        g = 0
+        b = int(t * 255)
         color = (r, g, b)
+        
+        # Use point_radius = 1 to draw single pixels/dots
         draw.ellipse(
             [x - point_radius, y - point_radius, x + point_radius, y + point_radius],
             fill=color,
-            outline=(255, 255, 255),
         )
     return overlay
+
 
 
 def build_sparse_depth_from_lidar_points(image_shape, visible_points):
@@ -435,6 +454,62 @@ def prepare_model_inputs(rgb_image, sparse_image):
     return rgb_tensor, raw_tensor, hole_tensor, relative
 
 
+class TRTModel:
+    def __init__(self, engine_path):
+        if trt is None:
+            raise ImportError("Thư viện tensorrt chưa được cài đặt.")
+        self.logger = trt.Logger(trt.Logger.WARNING)
+        with open(engine_path, "rb") as f, trt.Runtime(self.logger) as runtime:
+            self.engine = runtime.deserialize_cuda_engine(f.read())
+        self.context = self.engine.create_execution_context()
+        
+        self.inputs = {}
+        self.outputs = {}
+        self.bindings = []
+        
+        for i in range(self.engine.num_bindings):
+            name = self.engine.get_binding_name(i)
+            dtype = trt.nptype(self.engine.get_binding_dtype(i))
+            shape = self.engine.get_binding_shape(i)
+            is_input = self.engine.binding_is_input(i)
+            
+            binding_info = {"shape": shape, "dtype": dtype, "index": i}
+            if is_input:
+                self.inputs[name] = binding_info
+            else:
+                self.outputs[name] = binding_info
+                
+        # Auto-detect target shape from the 'rgb' input binding
+        rgb_info = self.inputs.get('rgb', list(self.inputs.values())[0])
+        rgb_shape = rgb_info['shape']
+        self.target_h = rgb_shape[2]
+        self.target_w = rgb_shape[3]
+
+    def infer(self, rgb_tensor, raw_tensor, hole_tensor):
+        rgb_cuda = rgb_tensor.cuda().contiguous()
+        raw_cuda = raw_tensor.cuda().contiguous()
+        hole_cuda = hole_tensor.cuda().contiguous()
+        
+        out_name = list(self.outputs.keys())[0]
+        out_shape = self.outputs[out_name]['shape']
+        out_cuda = torch.empty(tuple(out_shape), dtype=torch.float32, device='cuda')
+        
+        bindings = [None] * self.engine.num_bindings
+        
+        rgb_idx = self.inputs['rgb']['index']
+        raw_idx = self.inputs['raw']['index']
+        hole_idx = self.inputs.get('hole_raw', self.inputs.get('hole', list(self.inputs.values())[2]))['index']
+        out_idx = self.outputs[out_name]['index']
+        
+        bindings[rgb_idx] = rgb_cuda.data_ptr()
+        bindings[raw_idx] = raw_cuda.data_ptr()
+        bindings[hole_idx] = hole_cuda.data_ptr()
+        bindings[out_idx] = out_cuda.data_ptr()
+        
+        self.context.execute_v2(bindings)
+        return out_cuda.cpu()
+
+
 class ModelManager:
     def __init__(self):
         self.model_path = None
@@ -442,6 +517,7 @@ class ModelManager:
         self.model = None
         self.session = None
         self.compiled = None
+        self.trt_model = None
 
     def load(self, model_path):
         self.model_path = model_path
@@ -449,6 +525,7 @@ class ModelManager:
         self.model = None
         self.session = None
         self.compiled = None
+        self.trt_model = None
         if self.model_type == ".pth":
             self.model = UNet(rezero=True)
             checkpoint = torch.load(model_path, map_location="cpu")
@@ -463,7 +540,6 @@ class ModelManager:
             if ort is None:
                 raise RuntimeError("onnxruntime is not installed")
             self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
-            # Auto-detect shape
             try:
                 input_shape = self.session.get_inputs()[0].shape
                 self.target_h = input_shape[2]
@@ -471,7 +547,7 @@ class ModelManager:
             except Exception as e:
                 print(f"Không tự động phát hiện được kích thước model ONNX: {e}")
                 self.target_h = 512
-                self.target_w = 640  # Mặc định mới cho Raspberry Pi Camera
+                self.target_w = 640
             return f"Loaded ONNX model: {Path(model_path).name} with shape {self.target_w}x{self.target_h}"
         if self.model_type == ".xml":
             if ov is None:
@@ -479,7 +555,6 @@ class ModelManager:
             core = ov.Core()
             model = core.read_model(model=model_path)
             self.compiled = core.compile_model(model=model, device_name="CPU")
-            # Auto-detect shape
             try:
                 input_shape = self.compiled.inputs[0].shape
                 self.target_h = input_shape[2]
@@ -487,8 +562,17 @@ class ModelManager:
             except Exception as e:
                 print(f"Không tự động phát hiện được kích thước model OpenVINO: {e}")
                 self.target_h = 512
-                self.target_w = 640  # Mặc định mới cho Raspberry Pi Camera
+                self.target_w = 640
             return f"Loaded OpenVINO model: {Path(model_path).name} with shape {self.target_w}x{self.target_h}"
+        if self.model_type == ".engine":
+            if trt is None:
+                raise RuntimeError("tensorrt is not installed")
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA is not available, cannot run TensorRT .engine model")
+            self.trt_model = TRTModel(model_path)
+            self.target_h = self.trt_model.target_h
+            self.target_w = self.trt_model.target_w
+            return f"Loaded TensorRT Engine: {Path(model_path).name} with shape {self.target_w}x{self.target_h}"
         raise RuntimeError("Unsupported model type")
 
     def infer(self, rgb_tensor, raw_tensor, hole_tensor, original_shape=None):
@@ -527,6 +611,10 @@ class ModelManager:
             else:
                 output = results
             return torch.from_numpy(np.array(output))
+        if self.model_type == ".engine":
+            if self.trt_model is None:
+                raise RuntimeError("TensorRT model is not loaded")
+            return self.trt_model.infer(rgb_tensor, raw_tensor, hole_tensor)
         raise RuntimeError("Unsupported model type")
 
 
@@ -545,7 +633,7 @@ def run_model_inference(rgb_img, sparse_img, model_path):
             return None, None, f"Không load được model: {exc}", ""
     try:
         model_type = Path(model_path).suffix.lower()
-        if model_type in {".onnx", ".xml"}:
+        if model_type in {".onnx", ".xml", ".engine"}:
             target_h = getattr(model_manager, 'target_h', 512)
             target_w = getattr(model_manager, 'target_w', 640)
             rgb_np, sparse_np, original_shape, mode = resize_for_model(rgb_img, sparse_img, target_h=target_h, target_w=target_w)
@@ -562,7 +650,7 @@ def run_model_inference(rgb_img, sparse_img, model_path):
         pred_tensor = model_manager.infer(rgb_tensor, raw_tensor, hole_tensor, original_shape)
         elapsed = time.time() - start
 
-        if original_shape is not None and model_type in {".onnx", ".xml"}:
+        if original_shape is not None and model_type in {".onnx", ".xml", ".engine"}:
             pred_np = pred_tensor.squeeze().numpy()
             orig_h, orig_w = original_shape
             if mode == "pad":
@@ -583,81 +671,112 @@ def run_model_inference(rgb_img, sparse_img, model_path):
         return None, None, f"Lỗi inference: {exc}", ""
 
 
-class Pi5DataReceiver(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        return
+PI5_STREAM_URL = "http://192.168.3.2:8080/video"
+PI5_STREAM_THREAD = None
+PI5_STREAM_RUNNING = False
 
-    def do_POST(self):
-        if self.path == "/update_data":
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
-            try:
-                data = json.loads(post_data.decode('utf-8'))
+def pi5_receiver_worker(url):
+    global PI5_STREAM_RUNNING
+    PI5_STREAM_RUNNING = True
+    print(f"[Mạng] Bắt đầu luồng nhận dữ liệu Pi 5 từ: {url}")
+    
+    retry_delay = 2
+    while PI5_STREAM_RUNNING:
+        try:
+            with LATEST_PI5_LOCK:
+                LATEST_PI5_DATA["status"] = f"Đang kết nối tới {url}..."
                 
-                rgb_b64 = data.get("rgb")
-                lidar_data = data.get("lidar") # Raw RPLidar scan
-                sparse_b64 = data.get("sparse") # Optional pre-projected sparse depth
+            stream = urllib.request.urlopen(url, timeout=5)
+            
+            with LATEST_PI5_LOCK:
+                LATEST_PI5_DATA["status"] = "Đã kết nối, đang nhận dữ liệu..."
                 
-                rgb_img = None
-                if rgb_b64:
-                    rgb_bytes = base64.b64decode(rgb_b64)
-                    rgb_img = Image.open(io.BytesIO(rgb_bytes)).convert("RGB")
+            bytes_buffer = b''
+            
+            while PI5_STREAM_RUNNING:
+                chunk = stream.read(4096)
+                if not chunk:
+                    raise RuntimeError("Mất kết nối stream dữ liệu thô (empty read)")
+                bytes_buffer += chunk
                 
-                sparse_img = None
-                if sparse_b64:
-                    sparse_bytes = base64.b64decode(sparse_b64)
-                    sparse_img = Image.open(io.BytesIO(sparse_bytes)).convert("I")
-                
-                lidar_overlay_img = None
-                if rgb_img is not None:
-                    rgb_np = np.array(rgb_img)
-                    if lidar_data is not None:
-                        try:
-                            K, dist_coeffs, tvec, rvec = load_camera_lidar_calibration()
-                            visible_points = project_lidar_to_image(lidar_data, K, dist_coeffs, rvec, tvec, rgb_np.shape)
-                            lidar_overlay_img = draw_lidar_overlay(rgb_np, visible_points)
-                            sparse_img = build_sparse_depth_from_lidar_points(rgb_np.shape, visible_points)
-                        except Exception as e:
-                            print(f"Lỗi project LiDAR trên PC: {e}")
-                            lidar_overlay_img = rgb_img
-                    elif sparse_img is not None:
-                        # Draw overlay from sparse depth map
-                        sparse_np = np.array(sparse_img)
-                        ys, xs = np.where(sparse_np > 0)
-                        visible_points = [(x, y, float(sparse_np[y, x])) for x, y in zip(xs, ys)]
-                        lidar_overlay_img = draw_lidar_overlay(rgb_np, visible_points)
-                
-                with LATEST_PI5_LOCK:
-                    if rgb_img is not None:
-                        LATEST_PI5_DATA["rgb"] = rgb_img
-                    if lidar_overlay_img is not None:
-                        LATEST_PI5_DATA["lidar_overlay"] = lidar_overlay_img
-                    elif rgb_img is not None:
-                        LATEST_PI5_DATA["lidar_overlay"] = rgb_img
-                    if sparse_img is not None:
-                        LATEST_PI5_DATA["sparse_depth"] = sparse_img
-                    LATEST_PI5_DATA["timestamp"] = time.time()
-                    LATEST_PI5_DATA["status"] = f"Đã nhận dữ liệu mới lúc {time.strftime('%H:%M:%S')}"
-                
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "success"}).encode('utf-8'))
-            except Exception as e:
-                self.send_response(500)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
-        else:
-            self.send_response(404)
-            self.end_headers()
+                boundary_idx = bytes_buffer.find(b'--databoundary')
+                if boundary_idx != -1:
+                    package_data = bytes_buffer[:boundary_idx]
+                    bytes_buffer = bytes_buffer[boundary_idx + len(b'--databoundary'):]
+                    
+                    if b'X-Lidar-Data' in package_data:
+                        lines = package_data.split(b'\r\n')
+                        lidar_json = None
+                        
+                        for line in lines:
+                            if line.startswith(b'X-Lidar-Data:'):
+                                lidar_json_str = line.split(b'X-Lidar-Data:')[1].strip().decode('utf-8')
+                                lidar_json = json.loads(lidar_json_str)
+                                break
+                        
+                        header_end = package_data.find(b'\r\n\r\n')
+                        if header_end != -1 and lidar_json is not None:
+                            jpg_bytes = package_data[header_end + 4:]
+                            
+                            if len(jpg_bytes) > 0:
+                                img_array = np.frombuffer(jpg_bytes, dtype=np.uint8)
+                                rgb_np = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                                
+                                if rgb_np is not None:
+                                    rgb_np = cv2.cvtColor(rgb_np, cv2.COLOR_BGR2RGB)
+                                    rgb_img = Image.fromarray(rgb_np)
+                                    
+                                    scan = []
+                                    for pt in lidar_json:
+                                        if len(pt) == 2:
+                                            scan.append((15, pt[0], pt[1]))
+                                        elif len(pt) == 3:
+                                            scan.append((pt[0], pt[1], pt[2]))
+                                            
+                                    lidar_overlay_img = rgb_img
+                                    sparse_img = None
+                                    if scan:
+                                        try:
+                                            K, dist_coeffs, tvec, rvec = load_camera_lidar_calibration()
+                                            visible_points = project_lidar_to_image(scan, K, dist_coeffs, rvec, tvec, rgb_np.shape)
+                                            lidar_overlay_img = draw_lidar_overlay(rgb_np, visible_points)
+                                            sparse_img = build_sparse_depth_from_lidar_points(rgb_np.shape, visible_points)
+                                        except Exception as proj_err:
+                                            print(f"Lỗi project LiDAR trên PC: {proj_err}")
+                                            
+                                    with LATEST_PI5_LOCK:
+                                        LATEST_PI5_DATA["rgb"] = rgb_img
+                                        LATEST_PI5_DATA["lidar_overlay"] = lidar_overlay_img
+                                        if sparse_img is not None:
+                                            LATEST_PI5_DATA["sparse_depth"] = sparse_img
+                                        LATEST_PI5_DATA["timestamp"] = time.time()
+                                        LATEST_PI5_DATA["status"] = f"Đang nhận dữ liệu thời gian thực ({len(scan)} điểm LiDAR)"
+                                        
+        except Exception as err:
+            print(f"[Cảnh báo] Lỗi kết nối / nhận dữ liệu: {err}")
+            with LATEST_PI5_LOCK:
+                LATEST_PI5_DATA["status"] = f"Lỗi: {err}. Đang thử kết nối lại sau {retry_delay} giây..."
+            time.sleep(retry_delay)
+            
+    print("[Mạng] Đã dừng luồng nhận dữ liệu Pi 5.")
 
 
-def start_pi5_receiver_server(port=5000):
-    server = HTTPServer(('0.0.0.0', port), Pi5DataReceiver)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    print(f"HTTP Server nhận dữ liệu Pi 5 đang chạy tại port {port}...")
+def start_pi5_stream_client(url):
+    global PI5_STREAM_THREAD, PI5_STREAM_RUNNING, PI5_STREAM_URL
+    PI5_STREAM_URL = url
+    stop_pi5_stream_client()
+    PI5_STREAM_RUNNING = True
+    PI5_STREAM_THREAD = threading.Thread(target=pi5_receiver_worker, args=(url,), daemon=True)
+    PI5_STREAM_THREAD.start()
+
+
+def stop_pi5_stream_client():
+    global PI5_STREAM_RUNNING, PI5_STREAM_THREAD
+    PI5_STREAM_RUNNING = False
+    if PI5_STREAM_THREAD is not None:
+        PI5_STREAM_THREAD.join(timeout=1.0)
+        PI5_STREAM_THREAD = None
+
 
 
 def capture_realsense_frame():
@@ -755,9 +874,14 @@ def infer_pipeline(model_path, uploaded_rgb, uploaded_depth):
     return run_model_inference(uploaded_rgb, uploaded_depth, model_path)
 
 
+def update_pi5_connection(url):
+    start_pi5_stream_client(url)
+    return f"Đang kết nối tới {url}..."
+
+
 def main():
-    # Khởi chạy HTTP receiver server ở port 5000 nhận dữ liệu từ Pi 5
-    start_pi5_receiver_server(port=5000)
+    # Khởi chạy stream client nhận dữ liệu từ Pi 5 tự động
+    start_pi5_stream_client("http://192.168.3.2:8080/video")
 
     # JavaScript lắng nghe phím Space để kích hoạt nút Capture
     head_html = """
@@ -769,7 +893,7 @@ def main():
         if (e.code === "Space") {
             e.preventDefault();
             const buttons = Array.from(document.querySelectorAll("button"));
-            const captureBtn = buttons.find(btn => btn.textContent.includes("Inference từ Pi 5") || btn.textContent.includes("Capture"));
+            const captureBtn = buttons.find(btn => btn.textContent.includes("Inference từ dữ liệu") || btn.textContent.includes("Capture"));
             if (captureBtn) {
                 captureBtn.click();
             }
@@ -778,10 +902,10 @@ def main():
     </script>
     """
 
-    with gr.Blocks(title="Depth Completion Gradio App", head=head_html) as demo:
+    with gr.Blocks(title="Depth Completion Gradio App (PC Server)", head=head_html) as demo:
         gr.Markdown(
-            "# Depth Completion Inference App\n"
-            "Sử dụng RGB + dữ liệu sparse depth từ LiDAR để tạo depth map hoàn chỉnh."
+            "# Depth Completion Inference Server (PC Version)\n"
+            "Ứng dụng chạy trên PC nhận dữ liệu từ Raspberry Pi 5 (RGB + LiDAR) dạng MJPEG Stream và so sánh tham chiếu trực tiếp với Camera RealSense (Ground Truth)."
         )
 
         with gr.Row():
@@ -789,8 +913,12 @@ def main():
 
         with gr.Tabs():
             with gr.Tab("Live capture"):
-                live_button = gr.Button("Capture & Inference")
-                gr.Markdown("*Chụp ảnh trực tiếp từ Pi Camera và ánh xạ LiDAR bằng RPLIDAR, đồng thời so sánh với RealSense.*")
+                with gr.Row():
+                    pi5_url_input = gr.Textbox(label="Pi 5 Stream URL", value="http://192.168.3.2:8080/video", scale=3)
+                    connect_btn = gr.Button("⚡ Kết nối / Đổi URL", scale=1)
+                
+                live_button = gr.Button("Capture & Inference", variant="primary")
+                gr.Markdown("*Nhận ảnh RGB từ Pi Camera 2 và dữ liệu LiDAR truyền trực tiếp dạng MJPEG Stream từ Raspberry Pi 5.*")
                 
                 with gr.Row():
                     gr.Markdown("### 1. Đầu vào từ Raspberry Pi 5")
@@ -821,10 +949,21 @@ def main():
                 direct_status = gr.Textbox(label="Trạng thái", interactive=False)
                 direct_elapsed = gr.Textbox(label="Inference time", interactive=False)
 
+        connect_btn.click(
+            fn=update_pi5_connection,
+            inputs=[pi5_url_input],
+            outputs=[live_status],
+        )
+
         live_button.click(
             fn=live_infer_pipeline,
             inputs=[model_selector],
-            outputs=[live_captured_rgb, live_lidar_overlay, live_depth, live_colormap, rs_rgb, rs_depth_colormap, live_status, live_elapsed],
+            outputs=[
+                live_captured_rgb, live_lidar_overlay, 
+                live_depth, live_colormap, 
+                rs_rgb, rs_depth_colormap, 
+                live_status, live_elapsed
+            ],
         )
 
         direct_button.click(
