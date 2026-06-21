@@ -52,8 +52,11 @@ except ImportError:
 
 try:
     import tensorrt as trt
+    import pycuda.driver as cuda
+    import pycuda.autoinit
 except ImportError:
     trt = None
+    cuda = None
 
 import base64
 import io
@@ -74,7 +77,6 @@ from src.networks import UNet
 
 ROOT = Path(__file__).resolve().parent
 MODEL_DIR = ROOT / "checkpoints" / "models"
-DATASET_DIR = ROOT / "Private_Test_Datasets"
 
 
 def scan_models(model_dir=MODEL_DIR):
@@ -85,16 +87,6 @@ def scan_models(model_dir=MODEL_DIR):
         if path.suffix.lower() in {".pth", ".onnx", ".xml", ".engine"}:
             models.append(str(path))
     return models
-
-
-def scan_test_ids(dataset_dir=DATASET_DIR):
-    rgb_dir = dataset_dir / "Rgb"
-    if not rgb_dir.exists():
-        return []
-    ids = []
-    for file in sorted(rgb_dir.glob("*_rgb.png")):
-        ids.append(file.stem.replace("_rgb", ""))
-    return ids
 
 
 DEFAULT_LIDAR_PORT = "COM3" if os.name == "nt" else "/dev/ttyUSB0"
@@ -129,71 +121,6 @@ def capture_picamera2_rgb(target_size=(640, 480)):
         picam2.stop()
         picam2.close()
     return frame
-
-
-def capture_rplidar_scan(port=DEFAULT_LIDAR_PORT, timeout=10.0):
-    if RPLidar is None:
-        raise RuntimeError("RPLidar chưa được cài đặt hoặc không tìm thấy trên hệ thống.")
-    lidar = RPLidar(port, baudrate=115200, timeout=3)
-    try:
-        lidar.get_info()
-        lidar.get_health()
-
-        # Start motor and wait for it to stabilize
-        if hasattr(lidar, "start_motor"):
-            lidar.start_motor()
-        time.sleep(3.0)
-
-        # Flush stale data from serial buffer to prevent "Wrong body size" error
-        serial_obj = getattr(lidar, "_serial", None) or getattr(lidar, "_serial_port", None)
-        if serial_obj and hasattr(serial_obj, "reset_input_buffer"):
-            serial_obj.reset_input_buffer()
-        if hasattr(lidar, "clean_input"):
-            lidar.clean_input()
-
-        scan_result = queue.Queue()
-
-        def scan_worker():
-            try:
-                scan = next(lidar.iter_scans(max_buf_meas=1000))
-                scan_result.put(("ok", scan))
-            except Exception as exc:
-                scan_result.put(("err", exc))
-
-        worker = threading.Thread(target=scan_worker, daemon=True)
-        worker.start()
-
-        try:
-            status, payload = scan_result.get(timeout=timeout)
-        except queue.Empty:
-            raise RuntimeError(f"RPLidar scan timeout after {timeout:.1f}s")
-
-        if status == "err":
-            raise payload
-
-        return payload
-    finally:
-        try:
-            lidar.stop()
-        except Exception:
-            pass
-        if hasattr(lidar, "stop_motor"):
-            try:
-                lidar.stop_motor()
-            except Exception:
-                pass
-        try:
-            lidar.disconnect()
-        except Exception:
-            pass
-
-
-def angle_distance_to_lidar_xz(angle_deg, distance_mm):
-    rad = np.deg2rad(angle_deg)
-    x = np.sin(rad) * distance_mm
-    z = np.cos(rad) * distance_mm
-    return x, z
-
 
 def project_lidar_to_image(scan, K, dist_coeffs, rvec, tvec, image_shape):
     if cv2 is None:
@@ -283,8 +210,6 @@ def draw_lidar_overlay(rgb_frame, visible_points, point_radius=1):
             fill=color,
         )
     return overlay
-
-
 
 def build_sparse_depth_from_lidar_points(image_shape, visible_points):
     h, w = image_shape[:2]
@@ -426,23 +351,6 @@ def depth_to_colormap(depth_uint16):
     return Image.fromarray(rgb)
 
 
-def load_dataset_sample(sample_id, use_fusion=False):
-    rgb_path = DATASET_DIR / "Rgb" / f"{sample_id}_rgb.png"
-    lidar_path = DATASET_DIR / "Lidar" / f"{sample_id}_lidar.json"
-    depth_path = DATASET_DIR / "Depth" / f"{sample_id}_depth_16bit.png"
-    if use_fusion:
-        fusion_path = DATASET_DIR / "Rgb - fusion" / f"{sample_id}_rgb_fusion.png"
-        if fusion_path.exists():
-            rgb_path = fusion_path
-    if not rgb_path.exists() or not lidar_path.exists() or not depth_path.exists():
-        raise FileNotFoundError("Sample data missing from Private_Test_Datasets")
-    rgb = Image.open(rgb_path).convert("RGB")
-    gt_depth = Image.open(depth_path).convert("I")
-    sparse = build_sparse_depth_from_lidar(np.array(gt_depth).astype(np.float32) / 65535.0, lidar_path)
-    sparse_img = Image.fromarray((sparse * 65535.0).astype(np.uint16))
-    return rgb, sparse_img
-
-
 def prepare_model_inputs(rgb_image, sparse_image):
     rgb_np = read_rgb_image(rgb_image)
     raw_np = read_depth_image(sparse_image)
@@ -455,59 +363,124 @@ def prepare_model_inputs(rgb_image, sparse_image):
 
 
 class TRTModel:
+    """TensorRT inference using native PyCUDA memory management (matching test_engine.py approach).
+    
+    Uses the new TensorRT API (num_io_tensors, get_tensor_name, set_tensor_address, 
+    execute_async_v3) with PyCUDA buffers to avoid CUDA context issues in Gradio threads.
+    """
     def __init__(self, engine_path):
         if trt is None:
             raise ImportError("Thư viện tensorrt chưa được cài đặt.")
-        self.logger = trt.Logger(trt.Logger.WARNING)
-        with open(engine_path, "rb") as f, trt.Runtime(self.logger) as runtime:
-            self.engine = runtime.deserialize_cuda_engine(f.read())
-        self.context = self.engine.create_execution_context()
+        if cuda is None:
+            raise ImportError("Thư viện pycuda chưa được cài đặt.")
         
-        self.inputs = {}
-        self.outputs = {}
-        self.bindings = []
+        # 1. Khởi tạo CUDA Context thủ công cho riêng mô hình này
+        self.cfx = cuda.Device(0).make_context()
         
-        for i in range(self.engine.num_bindings):
-            name = self.engine.get_binding_name(i)
-            dtype = trt.nptype(self.engine.get_binding_dtype(i))
-            shape = self.engine.get_binding_shape(i)
-            is_input = self.engine.binding_is_input(i)
+        try:
+            self.logger = trt.Logger(trt.Logger.WARNING)
+            with open(engine_path, "rb") as f:
+                runtime = trt.Runtime(self.logger)
+                self.engine = runtime.deserialize_cuda_engine(f.read())
             
-            binding_info = {"shape": shape, "dtype": dtype, "index": i}
-            if is_input:
-                self.inputs[name] = binding_info
-            else:
-                self.outputs[name] = binding_info
+            if self.engine is None:
+                raise RuntimeError(f"Không thể load TensorRT engine từ {engine_path}")
+            
+            self.context = self.engine.create_execution_context()
+            
+            # Allocate buffers using PyCUDA (same approach as test_engine.py)
+            self.trt_inputs = []
+            self.trt_outputs = []
+            self.stream = cuda.Stream()
+            
+            for i in range(self.engine.num_io_tensors):
+                name = self.engine.get_tensor_name(i)
+                dtype = trt.nptype(self.engine.get_tensor_dtype(name))
+                shape = self.engine.get_tensor_shape(name)
                 
-        # Auto-detect target shape from the 'rgb' input binding
-        rgb_info = self.inputs.get('rgb', list(self.inputs.values())[0])
-        rgb_shape = rgb_info['shape']
-        self.target_h = rgb_shape[2]
-        self.target_w = rgb_shape[3]
+                size = trt.volume(shape)
+                host_mem = cuda.pagelocked_empty(size, dtype)
+                device_mem = cuda.mem_alloc(host_mem.nbytes)
+                
+                tensor_info = {
+                    "name": name,
+                    "dtype": dtype,
+                    "shape": shape,
+                    "host": host_mem,
+                    "device": device_mem,
+                }
+                
+                if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                    self.trt_inputs.append(tensor_info)
+                else:
+                    self.trt_outputs.append(tensor_info)
+            
+            # Auto-detect target shape from the first input (rgb)
+            self.target_h = 512
+            self.target_w = 640
+            try:
+                if self.trt_inputs:
+                    rgb_shape = self.trt_inputs[0]['shape']
+                    if len(rgb_shape) == 4:
+                        h = rgb_shape[2]
+                        w = rgb_shape[3]
+                        if h > 0 and w > 0:
+                            self.target_h = h
+                            self.target_w = w
+            except Exception as e:
+                print(f"[TensorRT] Cảnh báo phát hiện shape: {e}")
+        finally:
+            # Thu hồi context ra khỏi luồng khởi tạo để tránh xung đột ngữ cảnh sau này
+            self.cfx.pop()
 
     def infer(self, rgb_tensor, raw_tensor, hole_tensor):
-        rgb_cuda = rgb_tensor.cuda().contiguous()
-        raw_cuda = raw_tensor.cuda().contiguous()
-        hole_cuda = hole_tensor.cuda().contiguous()
-        
-        out_name = list(self.outputs.keys())[0]
-        out_shape = self.outputs[out_name]['shape']
-        out_cuda = torch.empty(tuple(out_shape), dtype=torch.float32, device='cuda')
-        
-        bindings = [None] * self.engine.num_bindings
-        
-        rgb_idx = self.inputs['rgb']['index']
-        raw_idx = self.inputs['raw']['index']
-        hole_idx = self.inputs.get('hole_raw', self.inputs.get('hole', list(self.inputs.values())[2]))['index']
-        out_idx = self.outputs[out_name]['index']
-        
-        bindings[rgb_idx] = rgb_cuda.data_ptr()
-        bindings[raw_idx] = raw_cuda.data_ptr()
-        bindings[hole_idx] = hole_cuda.data_ptr()
-        bindings[out_idx] = out_cuda.data_ptr()
-        
-        self.context.execute_v2(bindings)
-        return out_cuda.cpu()
+        """Run inference using PyCUDA host/device memory copies (same as test_engine.py)."""
+        # 2. Đẩy CUDA context vào luồng hiện tại của Gradio đang thực hiện cuộc gọi hàm này
+        self.cfx.push()
+        try:
+            # Convert torch tensors to numpy arrays
+            input_arrays = [
+                rgb_tensor.numpy().astype(np.float32),
+                raw_tensor.numpy().astype(np.float32),
+                hole_tensor.numpy().astype(np.float32),
+            ]
+            
+            # Copy input data to host pinned memory, then to device
+            for tensor_info, array in zip(self.trt_inputs, input_arrays):
+                array = np.ascontiguousarray(array)
+                flat_host = np.frombuffer(tensor_info["host"], dtype=tensor_info["dtype"])
+                if flat_host.size != array.size:
+                    raise ValueError(
+                        f"Input shape mismatch for '{tensor_info['name']}': "
+                        f"expected {flat_host.size}, got {array.size}"
+                    )
+                flat_host[:] = array.ravel()
+                cuda.memcpy_htod_async(tensor_info["device"], tensor_info["host"], self.stream)
+            
+            # Set tensor addresses for execution context
+            for tensor_info in self.trt_inputs:
+                self.context.set_tensor_address(tensor_info["name"], int(tensor_info["device"]))
+            for tensor_info in self.trt_outputs:
+                self.context.set_tensor_address(tensor_info["name"], int(tensor_info["device"]))
+            
+            # Execute inference
+            self.context.execute_async_v3(stream_handle=self.stream.handle)
+            
+            # Copy output from device to host
+            for out in self.trt_outputs:
+                cuda.memcpy_dtoh_async(out["host"], out["device"], self.stream)
+            self.stream.synchronize()
+            
+            # Reconstruct output as torch tensor
+            results = []
+            for out in self.trt_outputs:
+                result = np.frombuffer(out["host"], dtype=out["dtype"]).reshape(out["shape"])
+                results.append(result.copy())
+            
+            return torch.from_numpy(results[0])
+        finally:
+            # 3. Thu hồi context khỏi luồng hiện tại để dọn sạch stack ngữ cảnh CUDA
+            self.cfx.pop()
 
 
 class ModelManager:
@@ -518,109 +491,130 @@ class ModelManager:
         self.session = None
         self.compiled = None
         self.trt_model = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Khóa Lock để ngăn chặn xung đột đồng thời giữa các luồng Gradio
+        self.lock = threading.Lock()
 
     def load(self, model_path):
-        self.model_path = model_path
-        self.model_type = Path(model_path).suffix.lower()
-        self.model = None
-        self.session = None
-        self.compiled = None
-        self.trt_model = None
-        if self.model_type == ".pth":
-            self.model = UNet(rezero=True)
-            checkpoint = torch.load(model_path, map_location="cpu")
-            if isinstance(checkpoint, dict) and "network" in checkpoint:
-                state_dict = checkpoint["network"]
-            else:
-                state_dict = checkpoint
-            self.model.load_state_dict(state_dict, strict=False)
-            self.model.eval()
-            return f"Loaded PyTorch model: {Path(model_path).name}"
-        if self.model_type == ".onnx":
-            if ort is None:
-                raise RuntimeError("onnxruntime is not installed")
-            self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        with self.lock:
+            # Kiểm tra lại một lần nữa phòng trường hợp một luồng khác đã load xong trong lúc đợi khóa
+            if self.model_path == model_path:
+                return f"Loaded Model: {Path(model_path).name} (luồng khác đã thực hiện tải)"
+
+            self.model = None
+            self.session = None
+            self.compiled = None
+            self.trt_model = None
+            self.model_type = Path(model_path).suffix.lower()
+            
             try:
-                input_shape = self.session.get_inputs()[0].shape
-                self.target_h = input_shape[2]
-                self.target_w = input_shape[3]
-            except Exception as e:
-                print(f"Không tự động phát hiện được kích thước model ONNX: {e}")
-                self.target_h = 512
-                self.target_w = 640
-            return f"Loaded ONNX model: {Path(model_path).name} with shape {self.target_w}x{self.target_h}"
-        if self.model_type == ".xml":
-            if ov is None:
-                raise RuntimeError("openvino is not installed")
-            core = ov.Core()
-            model = core.read_model(model=model_path)
-            self.compiled = core.compile_model(model=model, device_name="CPU")
-            try:
-                input_shape = self.compiled.inputs[0].shape
-                self.target_h = input_shape[2]
-                self.target_w = input_shape[3]
-            except Exception as e:
-                print(f"Không tự động phát hiện được kích thước model OpenVINO: {e}")
-                self.target_h = 512
-                self.target_w = 640
-            return f"Loaded OpenVINO model: {Path(model_path).name} with shape {self.target_w}x{self.target_h}"
-        if self.model_type == ".engine":
-            if trt is None:
-                raise RuntimeError("tensorrt is not installed")
-            if not torch.cuda.is_available():
-                raise RuntimeError("CUDA is not available, cannot run TensorRT .engine model")
-            self.trt_model = TRTModel(model_path)
-            self.target_h = self.trt_model.target_h
-            self.target_w = self.trt_model.target_w
-            return f"Loaded TensorRT Engine: {Path(model_path).name} with shape {self.target_w}x{self.target_h}"
-        raise RuntimeError("Unsupported model type")
+                if self.model_type == ".pth":
+                    self.model = UNet(rezero=True)
+                    checkpoint = torch.load(model_path, map_location=self.device)
+                    if isinstance(checkpoint, dict) and "network" in checkpoint:
+                        state_dict = checkpoint["network"]
+                    else:
+                        state_dict = checkpoint
+                    self.model.load_state_dict(state_dict, strict=False)
+                    self.model.to(self.device)
+                    self.model.eval()
+                    self.model_path = model_path
+                    return f"Loaded PyTorch model: {Path(model_path).name}"
+                if self.model_type == ".onnx":
+                    if ort is None:
+                        raise RuntimeError("onnxruntime is not installed")
+                    self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+                    try:
+                        input_shape = self.session.get_inputs()[0].shape
+                        self.target_h = input_shape[2]
+                        self.target_w = input_shape[3]
+                    except Exception as e:
+                        print(f"Không tự động phát hiện được kích thước model ONNX: {e}")
+                        self.target_h = 512
+                        self.target_w = 640
+                    self.model_path = model_path
+                    return f"Loaded ONNX model: {Path(model_path).name} with shape {self.target_w}x{self.target_h}"
+                if self.model_type == ".xml":
+                    if ov is None:
+                        raise RuntimeError("openvino is not installed")
+                    core = ov.Core()
+                    model = core.read_model(model=model_path)
+                    self.compiled = core.compile_model(model=model, device_name="CPU")
+                    try:
+                        input_shape = self.compiled.inputs[0].shape
+                        self.target_h = input_shape[2]
+                        self.target_w = input_shape[3]
+                    except Exception as e:
+                        print(f"Không tự động phát hiện được kích thước model OpenVINO: {e}")
+                        self.target_h = 512
+                        self.target_w = 640
+                    self.model_path = model_path
+                    return f"Loaded OpenVINO model: {Path(model_path).name} with shape {self.target_w}x{self.target_h}"
+                if self.model_type == ".engine":
+                    if trt is None:
+                        raise RuntimeError("tensorrt is not installed")
+                    if cuda is None:
+                        raise RuntimeError("pycuda is not installed, cannot run TensorRT .engine model")
+                    self.trt_model = TRTModel(model_path)
+                    self.target_h = self.trt_model.target_h
+                    self.target_w = self.trt_model.target_w
+                    self.model_path = model_path
+                    return f"Loaded TensorRT Engine: {Path(model_path).name} with shape {self.target_w}x{self.target_h}"
+                raise RuntimeError("Unsupported model type")
+            except Exception:
+                # Load thất bại → reset model_path để hệ thống thử tải lại ở lần gọi sau
+                self.model_path = None
+                raise
 
     def infer(self, rgb_tensor, raw_tensor, hole_tensor, original_shape=None):
-        if self.model_type == ".pth":
-            padded_rgb, pad_info = pad_to_multiple(rgb_tensor, 64)
-            padded_raw, _ = pad_to_multiple(raw_tensor, 64)
-            padded_hole, _ = pad_to_multiple(hole_tensor, 64)
-            with torch.no_grad():
-                pred = self.model(padded_rgb, padded_raw, padded_hole)
-            if pad_info is not None:
-                pad_h, pad_w = pad_info
-                if pad_h > 0:
-                    pred = pred[:, :, :-pad_h, :]
-                if pad_w > 0:
-                    pred = pred[:, :, :, :-pad_w]
-            return pred
-        if self.model_type == ".onnx":
-            if self.session is None:
-                raise RuntimeError("ONNX session is not loaded")
-            inputs = {
-                input.name: np.ascontiguousarray(t.numpy().astype(np.float32))
-                for input, t in zip(self.session.get_inputs(), [rgb_tensor, raw_tensor, hole_tensor])
-            }
-            outputs = self.session.run(None, inputs)
-            return torch.from_numpy(np.array(outputs[0]))
-        if self.model_type == ".xml":
-            if self.compiled is None:
-                raise RuntimeError("OpenVINO model is not loaded")
-            inputs = {
-                inp.get_any_name(): np.ascontiguousarray(t.numpy().astype(np.float32))
-                for inp, t in zip(self.compiled.inputs, [rgb_tensor, raw_tensor, hole_tensor])
-            }
-            results = self.compiled(inputs)
-            if isinstance(results, dict):
-                output = next(iter(results.values()))
-            else:
-                output = results
-            return torch.from_numpy(np.array(output))
-        if self.model_type == ".engine":
-            if self.trt_model is None:
-                raise RuntimeError("TensorRT model is not loaded")
-            return self.trt_model.infer(rgb_tensor, raw_tensor, hole_tensor)
-        raise RuntimeError("Unsupported model type")
+        with self.lock:
+            if self.model_type == ".pth":
+                padded_rgb, pad_info = pad_to_multiple(rgb_tensor, 64)
+                padded_raw, _ = pad_to_multiple(raw_tensor, 64)
+                padded_hole, _ = pad_to_multiple(hole_tensor, 64)
+                padded_rgb = padded_rgb.to(self.device)
+                padded_raw = padded_raw.to(self.device)
+                padded_hole = padded_hole.to(self.device)        
+                with torch.no_grad():
+                    pred = self.model(padded_rgb, padded_raw, padded_hole)
+                if pad_info is not None:
+                    pad_h, pad_w = pad_info
+                    if pad_h > 0:
+                        pred = pred[:, :, :-pad_h, :]
+                    if pad_w > 0:
+                        pred = pred[:, :, :, :-pad_w]
+                return pred.cpu()
+            if self.model_type == ".onnx":
+                if self.session is None:
+                    raise RuntimeError("ONNX session is not loaded")
+                inputs = {
+                    input.name: np.ascontiguousarray(t.numpy().astype(np.float32))
+                    for input, t in zip(self.session.get_inputs(), [rgb_tensor, raw_tensor, hole_tensor])
+                }
+                outputs = self.session.run(None, inputs)
+                return torch.from_numpy(np.array(outputs[0]))
+            if self.model_type == ".xml":
+                if self.compiled is None:
+                    raise RuntimeError("OpenVINO model is not loaded")
+                inputs = {
+                    inp.get_any_name(): np.ascontiguousarray(t.numpy().astype(np.float32))
+                    for inp, t in zip(self.compiled.inputs, [rgb_tensor, raw_tensor, hole_tensor])
+                }
+                results = self.compiled(inputs)
+                if isinstance(results, dict):
+                    output = next(iter(results.values()))
+                else:
+                    output = results
+                return torch.from_numpy(np.array(output))
+            if self.model_type == ".engine":
+                if self.trt_model is None:
+                    raise RuntimeError("TensorRT model is not loaded")
+                return self.trt_model.infer(rgb_tensor, raw_tensor, hole_tensor)
+            raise RuntimeError("Unsupported model type")
 
 
 model_manager = ModelManager()
 MODEL_OPTIONS = scan_models()
-TEST_IDS = scan_test_ids()
 
 
 def run_model_inference(rgb_img, sparse_img, model_path):
@@ -630,6 +624,8 @@ def run_model_inference(rgb_img, sparse_img, model_path):
         try:
             model_manager.load(model_path)
         except Exception as exc:
+            import traceback
+            traceback.print_exc()
             return None, None, f"Không load được model: {exc}", ""
     try:
         model_type = Path(model_path).suffix.lower()
@@ -668,6 +664,8 @@ def run_model_inference(rgb_img, sparse_img, model_path):
         status = f"Inference hoàn thành trong {elapsed:.2f}s"
         return depth_img, colormap_img, status, f"{elapsed:.2f} seconds"
     except Exception as exc:
+        import traceback
+        traceback.print_exc()
         return None, None, f"Lỗi inference: {exc}", ""
 
 
